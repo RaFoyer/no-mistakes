@@ -33,6 +33,37 @@ func TestRunInsertAndGet(t *testing.T) {
 	}
 }
 
+func TestRunPersistsOnlyGitHubPublicationProfileRequirement(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+
+	selected, err := d.InsertRunWithOptions(repo.ID, "selected", "abc123", "def456", InsertRunOptions{
+		RequiresGitHubPublicationProfile: true,
+	})
+	if err != nil {
+		t.Fatalf("insert selected-profile run: %v", err)
+	}
+	unselected, err := d.InsertRun(repo.ID, "unselected", "abc124", "def456")
+	if err != nil {
+		t.Fatalf("insert unselected run: %v", err)
+	}
+
+	selected, err = d.GetRun(selected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unselected, err = d.GetRun(unselected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selected.RequiresGitHubPublicationProfile {
+		t.Fatal("selected-profile requirement was not durable")
+	}
+	if unselected.RequiresGitHubPublicationProfile {
+		t.Fatal("legacy/unselected run unexpectedly requires a publication profile")
+	}
+}
+
 func TestRunAwaitingAgentSetAndClear(t *testing.T) {
 	d := openTestDB(t)
 	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")

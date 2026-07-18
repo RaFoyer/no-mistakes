@@ -78,12 +78,13 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 
 			var result ipc.PushReceivedResult
 			return client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
-				Gate:      gatePath,
-				Ref:       ref,
-				Old:       oldSHA,
-				New:       newSHA,
-				SkipSteps: skipSteps,
-				Intent:    intent,
+				Gate:            gatePath,
+				Ref:             ref,
+				Old:             oldSHA,
+				New:             newSHA,
+				SkipSteps:       skipSteps,
+				Intent:          intent,
+				GitHubConfigDir: selectedGitHubConfigDir(),
 			}, &result)
 		},
 	}
@@ -99,6 +100,17 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 	_ = cmd.MarkFlagRequired("new")
 
 	return cmd
+}
+
+// selectedGitHubConfigDir preserves the distinction between an unselected
+// profile and an explicitly selected but empty profile. The daemon owns
+// canonicalization and fail-closed validation at the IPC trust boundary.
+func selectedGitHubConfigDir() *string {
+	value, selected := os.LookupEnv("GH_CONFIG_DIR")
+	if !selected {
+		return nil
+	}
+	return &value
 }
 
 func normalizeNotifyGatePath(gate string) (string, error) {

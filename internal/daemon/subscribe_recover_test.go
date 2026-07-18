@@ -561,6 +561,94 @@ func TestRecoverOnStartup_ReconcilesHistoricalCIGateFromCurrentPRState(t *testin
 	}
 }
 
+func TestRecoverOnStartup_SelectedProfileCIGateFailsBeforeAmbientGH(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "dtest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(tmpDir) })
+	p := paths.WithRoot(tmpDir)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	mockClaude := writeMockClaude(t, t.TempDir())
+	if err := os.WriteFile(p.ConfigFile(), []byte("agent: claude\nagent_path_override:\n  claude: "+mockClaude+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	repo, headSHA := setupTestGitRepo(t, p, d, "selected-profile-reconcile-parked-ci")
+	run, err := d.InsertRunWithOptions(repo.ID, "feature", headSHA, headSHA, db.InsertRunOptions{
+		RequiresGitHubPublicationProfile: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateRunPRURL(run.ID, "https://github.com/test/repo/pull/42"); err != nil {
+		t.Fatal(err)
+	}
+	prURL := "https://github.com/test/repo/pull/42"
+	run.PRURL = &prURL
+	worktree := p.WorktreeDir(repo.ID, run.ID)
+	if err := gitpkg.WorktreeAdd(context.Background(), p.RepoDir(repo.ID), worktree, headSHA); err != nil {
+		t.Fatal(err)
+	}
+	step, err := d.InsertStepResult(run.ID, types.StepCI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.StartStep(step.ID); err != nil {
+		t.Fatal(err)
+	}
+	findings := `{"findings":[{"id":"ci-1","severity":"warning","description":"PR was still open when CI monitoring timed out","action":"ask-user"}],"summary":"CI monitoring timed out before PR was merged or closed"}`
+	if err := d.SetStepFindings(step.ID, findings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.InsertStepRound(step.ID, 1, "initial", &findings, nil, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateStepStatusWithDuration(step.ID, types.StepStatusAwaitingApproval, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetRunAwaitingAgent(run.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	ghDir, ghLog := writeMockGHState(t, t.TempDir(), "MERGED")
+	t.Setenv("PATH", ghDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- RunWithOptions(p, d, func() []pipeline.Step { return []pipeline.Step{&steps.CIStep{}} })
+	}()
+	defer func() {
+		client, dialErr := ipc.Dial(p.Socket())
+		if dialErr == nil {
+			_ = client.Call(ipc.MethodShutdown, &ipc.ShutdownParams{}, nil)
+			_ = client.Close()
+		}
+		select {
+		case <-errCh:
+		case <-time.After(3 * time.Second):
+			t.Error("daemon did not stop")
+		}
+	}()
+
+	failed := waitForRunTerminalState(t, d, run.ID)
+	if failed.Status != types.RunFailed || failed.Error == nil || *failed.Error != githubPublicationProfileUnavailable {
+		t.Fatalf("selected-profile recovery = status %s error %v, want generic fail-closed error", failed.Status, failed.Error)
+	}
+	if _, err := os.Stat(ghLog); !os.IsNotExist(err) {
+		data, _ := os.ReadFile(ghLog)
+		t.Fatalf("selected-profile recovery invoked ambient gh: %q (stat error %v)", data, err)
+	}
+}
+
 func TestRecoverCleansUpOrphanedWorktrees(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "dtest")
 	if err != nil {

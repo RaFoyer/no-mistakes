@@ -29,6 +29,9 @@ func TestMain(m *testing.M) {
 func handleFakeCLI(mode string) {
 	args := os.Args[1:]
 	logFile := os.Getenv("FAKE_CLI_LOG")
+	if expected := os.Getenv("FAKE_CLI_EXPECT_GH_CONFIG_DIR"); expected != "" && os.Getenv("GH_CONFIG_DIR") != expected {
+		os.Exit(97)
+	}
 
 	if logFile != "" {
 		f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)

@@ -21,6 +21,7 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/routing"
+	"github.com/kunchenguid/no-mistakes/internal/scm"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -35,6 +36,10 @@ const (
 
 var errAuthorizationParked = errors.New("agent authorization required; run parked for authentication recovery")
 
+// GitHubPublicationProfileUnavailable is deliberately value-safe: it reports
+// lost selected-profile custody without exposing the selected path.
+const GitHubPublicationProfileUnavailable = "selected GitHub publication profile is unavailable"
+
 const authorizationRecoveryLimit = 1
 
 type approvalResponse struct {
@@ -46,12 +51,14 @@ type approvalResponse struct {
 
 // Executor runs pipeline steps sequentially and coordinates approval interactions.
 type Executor struct {
-	db     *db.DB
-	paths  *paths.Paths
-	config *config.Config
-	agent  agent.Agent
-	steps  []Step
-	skips  map[types.StepName]bool
+	db                         *db.DB
+	paths                      *paths.Paths
+	config                     *config.Config
+	agent                      agent.Agent
+	steps                      []Step
+	skips                      map[types.StepName]bool
+	githubPublicationConfigDir string
+	githubPublicationRequired  bool
 
 	onEvent EventFunc
 
@@ -72,6 +79,35 @@ type Executor struct {
 	routeConfigurationGeneration string
 	routeRisk                    routing.Risk
 	routeReviewConfirmed         bool
+}
+
+// SetGitHubPublicationConfigDir gives this run custody of a canonical,
+// non-secret gh configuration directory reference. It is never persisted.
+func (e *Executor) SetGitHubPublicationConfigDir(dir string) {
+	e.githubPublicationConfigDir = dir
+	e.githubPublicationRequired = true
+}
+
+// RequireGitHubPublicationProfile restores the private durable requirement
+// after restart without fabricating or recovering the process-local path.
+func (e *Executor) RequireGitHubPublicationProfile() {
+	e.githubPublicationRequired = true
+}
+
+func (e *Executor) publicationEnv(step types.StepName, repo *db.Repo) ([]string, error) {
+	if step != types.StepPR && step != types.StepCI {
+		return nil, nil
+	}
+	if repo == nil || scm.DetectProvider(repo.UpstreamURL) != scm.ProviderGitHub {
+		return nil, nil
+	}
+	if !e.githubPublicationRequired {
+		return nil, nil
+	}
+	if e.githubPublicationConfigDir == "" {
+		return nil, fmt.Errorf(GitHubPublicationProfileUnavailable)
+	}
+	return []string{"GH_CONFIG_DIR=" + e.githubPublicationConfigDir}, nil
 }
 
 // SetRouteContext supplies repository identity and the loaded configuration
@@ -285,6 +321,10 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	if err != nil {
 		return err
 	}
+	reconcileEnv, err := e.publicationEnv(gate.step.Name(), repo)
+	if err != nil {
+		return err
+	}
 	logDir := e.paths.RunLogDir(run.ID)
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		return e.failRun(run, repo, fmt.Errorf("create log dir: %w", err))
@@ -314,6 +354,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 		Agent:    e.agent,
 		Sessions: e.sessions,
 		Shared:   e.shared,
+		Env:      reconcileEnv,
 		Log: func(message string) {
 			slog.Info("recovered approval gate reconciliation", "run_id", run.ID, "step", gate.step.Name(), "message", message)
 		},
@@ -636,6 +677,10 @@ func recoveredLogPath(step *db.StepResult) string {
 // Returns (skipRemaining, error).
 func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult, run *db.Run, repo *db.Repo, workDir, logDir string, state stepExecutionState) (bool, error) {
 	stepName := step.Name()
+	publicationEnv, err := e.publicationEnv(stepName, repo)
+	if err != nil {
+		return false, err
+	}
 	logPath := filepath.Join(logDir, string(stepName)+".log")
 	finalExitCode := 0
 	autoFixLimit := 0
@@ -771,6 +816,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		Shared:           e.shared,
 		Fixing:           state.fixing,
 		PreviousFindings: state.previousFindings,
+		Env:              publicationEnv,
 		Log:              writeLog,
 		LogChunk:         writeLogChunk,
 		LogFile: func(text string) {

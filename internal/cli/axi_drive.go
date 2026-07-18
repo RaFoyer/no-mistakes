@@ -327,7 +327,10 @@ func activeRunLookupParams(repoID, branch string) *ipc.GetActiveRunParams {
 }
 
 func rerunParams(repoID, branch string, skipSteps []types.StepName, intent string) *ipc.RerunParams {
-	return &ipc.RerunParams{RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent}
+	return &ipc.RerunParams{
+		RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent,
+		GitHubConfigDir: selectedGitHubConfigDir(),
+	}
 }
 
 // driveRun polls a run until it reaches an approval gate, a terminal state, or

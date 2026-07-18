@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -83,6 +84,189 @@ func TestPushReceivedTracksRunTelemetry(t *testing.T) {
 	}
 	if _, ok := finished.fields["duration_ms"]; !ok {
 		t.Fatal("expected duration_ms in run finished telemetry")
+	}
+}
+
+func TestNormalizeSelectedGitHubConfigDir(t *testing.T) {
+	if got, err := normalizeSelectedGitHubConfigDir(nil); err != nil || got != nil {
+		t.Fatalf("unselected profile = %#v, %v; want nil, nil", got, err)
+	}
+
+	dir := t.TempDir()
+	canonicalDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := normalizeSelectedGitHubConfigDir(&dir)
+	if err != nil {
+		t.Fatalf("valid profile reference: %v", err)
+	}
+	if got == nil || *got != canonicalDir {
+		t.Fatalf("valid profile reference = %#v, want %q", got, canonicalDir)
+	}
+}
+
+func TestNormalizeSelectedGitHubConfigDirFailsClosedValueSafely(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "private-profile-name")
+	nonDirectory := filepath.Join(t.TempDir(), "profile-file")
+	if err := os.WriteFile(nonDirectory, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: ""},
+		{name: "relative", value: "relative/profile"},
+		{name: "leading-space", value: " " + missing},
+		{name: "newline", value: "bad\npath"},
+		{name: "nul", value: "bad\x00path"},
+		{name: "missing", value: missing},
+		{name: "non-directory", value: nonDirectory},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			value := tc.value
+			got, err := normalizeSelectedGitHubConfigDir(&value)
+			if err == nil || got != nil {
+				t.Fatalf("normalize(%q) = %#v, %v; want nil error", value, got, err)
+			}
+			if value != "" && strings.Contains(err.Error(), value) {
+				t.Fatalf("error exposed selected path: %v", err)
+			}
+		})
+	}
+}
+
+func TestPushReceivedScopesSelectedGitHubConfigDirToPublicationSteps(t *testing.T) {
+	recorder := &telemetryRecorder{}
+	restore := telemetry.SetDefaultForTesting(recorder)
+	defer restore()
+
+	reviewEnv := make(chan []string, 1)
+	prEnv := make(chan []string, 1)
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{
+			&mockEnvCaptureStep{name: types.StepReview, env: reviewEnv},
+			&mockEnvCaptureStep{name: types.StepPR, env: prEnv},
+		}
+	})
+	_, headSHA := setupTestGitRepo(t, p, d, "profile-run-repo")
+	profileDir := t.TempDir()
+	profileContents := "credential-material-must-not-be-read"
+	profileFile := filepath.Join(profileDir, "hosts.yml")
+	if err := os.WriteFile(profileFile, []byte(profileContents), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	canonicalDir, err := filepath.EvalSymlinks(profileDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var result ipc.PushReceivedResult
+	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir("profile-run-repo"), Ref: "refs/heads/main",
+		Old: strings.Repeat("0", 40), New: headSHA, GitHubConfigDir: &profileDir,
+	}, &result); err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRunTerminalState(t, d, result.RunID)
+	if run.Status != types.RunCompleted {
+		t.Fatalf("run status = %q, want completed", run.Status)
+	}
+	if !run.RequiresGitHubPublicationProfile {
+		t.Fatal("selected-profile run did not persist its private requirement boolean")
+	}
+	if env := <-reviewEnv; len(env) != 0 {
+		t.Fatalf("review received publication profile env: %#v", env)
+	}
+	if env := <-prEnv; len(env) != 1 || env[0] != "GH_CONFIG_DIR="+canonicalDir {
+		t.Fatalf("PR env = %#v, want selected profile only", env)
+	}
+	if waitForTelemetryEvent(t, recorder, "run", "action", "finished") == nil {
+		t.Fatal("run did not emit terminal telemetry")
+	}
+
+	stepRows, err := d.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readProjection, err := json.Marshal(runToInfo(d, run, stepRows))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertValueSafe := func(surface string, data []byte) {
+		t.Helper()
+		for _, forbidden := range []string{canonicalDir, profileContents} {
+			if strings.Contains(string(data), forbidden) {
+				t.Fatalf("%s exposed selected publication profile material", surface)
+			}
+		}
+	}
+	assertValueSafe("status/read projection", readProjection)
+	if strings.Contains(string(readProjection), "requires_github_publication_profile") {
+		t.Fatal("status/read projection exposed private custody state")
+	}
+
+	recorder.mu.Lock()
+	events := append([]recordedTelemetryEvent(nil), recorder.events...)
+	recorder.mu.Unlock()
+	for _, event := range events {
+		fields, err := json.Marshal(event.fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertValueSafe("telemetry", fields)
+	}
+
+	if err := filepath.Walk(p.Root(), func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		assertValueSafe("database/log/internal state", data)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPushReceivedRejectsInvalidGitHubConfigDirWithoutCreatingRun(t *testing.T) {
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step { return []pipeline.Step{&mockPassStep{name: types.StepPR}} })
+	_, headSHA := setupTestGitRepo(t, p, d, "invalid-profile-run-repo")
+	missing := filepath.Join(t.TempDir(), "private-profile-name")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var result ipc.PushReceivedResult
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir("invalid-profile-run-repo"), Ref: "refs/heads/main",
+		Old: strings.Repeat("0", 40), New: headSHA, GitHubConfigDir: &missing,
+	}, &result)
+	if err == nil || err.Error() != githubPublicationProfileUnavailable {
+		t.Fatalf("invalid profile error = %v, want value-safe failure", err)
+	}
+	runs, err := d.GetRunsByRepo("invalid-profile-run-repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("invalid profile created %d runs, want 0", len(runs))
 	}
 }
 
@@ -445,7 +629,7 @@ func TestStartRunReturnsWhileProvisionerBlockedThirtySeconds(t *testing.T) {
 	t.Cleanup(m.Shutdown)
 
 	started := time.Now()
-	runID, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "")
+	runID, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -498,14 +682,14 @@ func TestProvisioningSupersessionWaitsForCancelledProvisioner(t *testing.T) {
 	}
 	t.Cleanup(m.Shutdown)
 
-	firstID, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "")
+	firstID, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitForChannel(t, firstBlocked, 5*time.Second, "first provisioning block")
 	secondDone := make(chan error, 1)
 	go func() {
-		_, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "")
+		_, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil)
 		secondDone <- err
 	}()
 	waitForChannel(t, firstCancelled, 5*time.Second, "first provisioning cancel")
@@ -545,7 +729,7 @@ func TestProvisioningWorkerSlotsBoundActiveSetup(t *testing.T) {
 	t.Cleanup(m.Shutdown)
 
 	for _, branch := range []string{"feature/one", "feature/two", "feature/three"} {
-		if _, err := m.startRun(context.Background(), repo, branch, headSHA, headSHA, "push", nil, ""); err != nil {
+		if _, err := m.startRun(context.Background(), repo, branch, headSHA, headSHA, "push", nil, "", nil); err != nil {
 			t.Fatalf("start %s: %v", branch, err)
 		}
 	}

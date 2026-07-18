@@ -3,12 +3,84 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 
+	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestExecutorScopesGitHubConfigDirToPRAndCIOnly(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	workDir := t.TempDir()
+	stepNames := []types.StepName{
+		types.StepIntent, types.StepRebase, types.StepReview, types.StepTest,
+		types.StepDocument, types.StepLint, types.StepPush, types.StepPR, types.StepCI,
+	}
+	seen := map[types.StepName][]string{}
+	steps := make([]Step, 0, len(stepNames))
+	for _, name := range stepNames {
+		name := name
+		steps = append(steps, &adaptiveCallStep{name: name, fn: func(sctx *StepContext) (*StepOutcome, error) {
+			seen[name] = append([]string(nil), sctx.Env...)
+			return &StepOutcome{}, nil
+		}})
+	}
+
+	exec := NewExecutor(database, p, nil, nil, steps, nil)
+	exec.SetGitHubPublicationConfigDir("/profiles/acos")
+	if err := exec.Execute(context.Background(), run, repo, workDir); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	want := []string{"GH_CONFIG_DIR=/profiles/acos"}
+	for _, name := range stepNames {
+		if name == types.StepPR || name == types.StepCI {
+			if !reflect.DeepEqual(seen[name], want) {
+				t.Errorf("%s env = %#v, want %#v", name, seen[name], want)
+			}
+			continue
+		}
+		if len(seen[name]) != 0 {
+			t.Errorf("%s received publication env: %#v", name, seen[name])
+		}
+	}
+}
+
+func TestExecutorKeepsConcurrentGitHubPublicationProfilesIsolated(t *testing.T) {
+	repo := &db.Repo{UpstreamURL: "https://github.com/test/repo"}
+	a := &Executor{}
+	b := &Executor{}
+	a.SetGitHubPublicationConfigDir("/profiles/a")
+	b.SetGitHubPublicationConfigDir("/profiles/b")
+	aEnv, err := a.publicationEnv(types.StepPR, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bEnv, err := b.publicationEnv(types.StepCI, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(aEnv, []string{"GH_CONFIG_DIR=/profiles/a"}) || !reflect.DeepEqual(bEnv, []string{"GH_CONFIG_DIR=/profiles/b"}) {
+		t.Fatalf("publication envs crossed custody: a=%#v b=%#v", aEnv, bEnv)
+	}
+}
+
+func TestExecutorFailsClosedWhenRequiredGitHubPublicationProfileIsUnavailable(t *testing.T) {
+	repo := &db.Repo{UpstreamURL: "https://github.com/test/repo"}
+	exec := &Executor{}
+	exec.RequireGitHubPublicationProfile()
+
+	for _, step := range []types.StepName{types.StepPR, types.StepCI} {
+		if env, err := exec.publicationEnv(step, repo); err == nil || err.Error() != GitHubPublicationProfileUnavailable || env != nil {
+			t.Fatalf("%s publication env = %#v, %v; want generic fail-closed error", step, env, err)
+		}
+	}
+	if env, err := exec.publicationEnv(types.StepReview, repo); err != nil || env != nil {
+		t.Fatalf("non-publication env = %#v, %v; want unchanged", env, err)
+	}
+}
 
 // TestExecutor_StepLifecycleEvents verifies the executor emits step_started
 // and step_completed IPC events for every step in order. The broader

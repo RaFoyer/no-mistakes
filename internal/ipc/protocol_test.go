@@ -124,12 +124,14 @@ func TestResponseError(t *testing.T) {
 }
 
 func TestPushReceivedParams(t *testing.T) {
+	githubConfigDir := "/profiles/acos"
 	params := PushReceivedParams{
-		Gate:      "/path/to/gate.git",
-		Ref:       "refs/heads/main",
-		Old:       "aaa",
-		New:       "bbb",
-		SkipSteps: []types.StepName{types.StepTest, types.StepLint},
+		Gate:            "/path/to/gate.git",
+		Ref:             "refs/heads/main",
+		Old:             "aaa",
+		New:             "bbb",
+		SkipSteps:       []types.StepName{types.StepTest, types.StepLint},
+		GitHubConfigDir: &githubConfigDir,
 	}
 	data, _ := json.Marshal(params)
 	var got PushReceivedParams
@@ -141,6 +143,9 @@ func TestPushReceivedParams(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.SkipSteps, params.SkipSteps) {
 		t.Errorf("skip_steps = %+v, want %+v", got.SkipSteps, params.SkipSteps)
+	}
+	if got.GitHubConfigDir == nil || *got.GitHubConfigDir != githubConfigDir {
+		t.Fatalf("github_config_dir = %#v, want %q", got.GitHubConfigDir, githubConfigDir)
 	}
 }
 
@@ -181,7 +186,8 @@ func TestGetActiveRunParams(t *testing.T) {
 }
 
 func TestRerunParams(t *testing.T) {
-	params := RerunParams{RepoID: "repo456", Branch: "feature", SkipSteps: []types.StepName{types.StepReview}}
+	githubConfigDir := "/profiles/acos"
+	params := RerunParams{RepoID: "repo456", Branch: "feature", SkipSteps: []types.StepName{types.StepReview}, GitHubConfigDir: &githubConfigDir}
 	data, _ := json.Marshal(params)
 	var got RerunParams
 	if err := json.Unmarshal(data, &got); err != nil {
@@ -195,6 +201,9 @@ func TestRerunParams(t *testing.T) {
 	}
 	if len(got.SkipSteps) != 1 || got.SkipSteps[0] != types.StepReview {
 		t.Errorf("skip_steps = %#v, want review", got.SkipSteps)
+	}
+	if got.GitHubConfigDir == nil || *got.GitHubConfigDir != githubConfigDir {
+		t.Fatalf("github_config_dir = %#v, want %q", got.GitHubConfigDir, githubConfigDir)
 	}
 }
 

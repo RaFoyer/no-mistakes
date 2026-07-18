@@ -70,6 +70,10 @@ type PushReceivedParams struct {
 	New       string           `json:"new"`
 	SkipSteps []types.StepName `json:"skip_steps,omitempty"`
 	Intent    string           `json:"intent,omitempty"`
+	// GitHubConfigDir is an explicitly selected, non-secret gh configuration
+	// directory reference. It is transported only to the in-memory run and is
+	// never returned by a read API or persisted with the run.
+	GitHubConfigDir *string `json:"github_config_dir,omitempty"`
 }
 
 // GetRunParams requests a single run by ID.
@@ -102,10 +106,11 @@ type GetActiveRunParams struct {
 // RerunParams requests a new run for the latest gate head on a branch.
 // Intent, when set, is stamped onto the new run like PushReceivedParams.Intent.
 type RerunParams struct {
-	RepoID    string           `json:"repo_id"`
-	Branch    string           `json:"branch"`
-	SkipSteps []types.StepName `json:"skip_steps,omitempty"`
-	Intent    string           `json:"intent,omitempty"`
+	RepoID          string           `json:"repo_id"`
+	Branch          string           `json:"branch"`
+	SkipSteps       []types.StepName `json:"skip_steps,omitempty"`
+	Intent          string           `json:"intent,omitempty"`
+	GitHubConfigDir *string          `json:"github_config_dir,omitempty"`
 }
 
 // SubscribeParams starts an event stream for a run.

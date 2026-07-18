@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS runs (
     blocked_reason       TEXT,
     awaiting_agent_since INTEGER,
     parked_ms            INTEGER,
+    requires_github_publication_profile INTEGER NOT NULL DEFAULT 0,
     created_at           INTEGER NOT NULL,
     updated_at           INTEGER NOT NULL
 );
@@ -214,6 +215,7 @@ var migrationStatements = []string{
 	`ALTER TABLE runs ADD COLUMN intent_score REAL`,
 	`ALTER TABLE runs ADD COLUMN awaiting_agent_since INTEGER`,
 	`ALTER TABLE runs ADD COLUMN parked_ms INTEGER`,
+	`ALTER TABLE runs ADD COLUMN requires_github_publication_profile INTEGER NOT NULL DEFAULT 0`,
 	`ALTER TABLE runs ADD COLUMN blocked_reason TEXT`,
 	`ALTER TABLE runs ADD COLUMN provisioning_phase TEXT NOT NULL DEFAULT 'created'`,
 	`ALTER TABLE runs ADD COLUMN provisioning_progress INTEGER NOT NULL DEFAULT 0`,

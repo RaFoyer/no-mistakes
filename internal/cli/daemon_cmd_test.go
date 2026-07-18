@@ -69,6 +69,27 @@ func TestNormalizeNotifyGatePathResolvesLegacyDotGate(t *testing.T) {
 	}
 }
 
+func TestSelectedGitHubConfigDirPreservesExplicitSelection(t *testing.T) {
+	t.Setenv("GH_CONFIG_DIR", "/profiles/acos")
+	got := selectedGitHubConfigDir()
+	if got == nil || *got != "/profiles/acos" {
+		t.Fatalf("selectedGitHubConfigDir() = %#v, want explicit path", got)
+	}
+}
+
+func TestSelectedGitHubConfigDirDistinguishesUnsetFromEmpty(t *testing.T) {
+	t.Setenv("GH_CONFIG_DIR", "")
+	if got := selectedGitHubConfigDir(); got == nil || *got != "" {
+		t.Fatalf("explicit empty selection = %#v, want pointer to empty string", got)
+	}
+	if err := os.Unsetenv("GH_CONFIG_DIR"); err != nil {
+		t.Fatal(err)
+	}
+	if got := selectedGitHubConfigDir(); got != nil {
+		t.Fatalf("unset selection = %#v, want nil", got)
+	}
+}
+
 func TestFormatSkipPushOptions(t *testing.T) {
 	got := formatSkipPushOptions([]types.StepName{types.StepTest, types.StepLint})
 	want := []string{"no-mistakes.skip=test,lint"}

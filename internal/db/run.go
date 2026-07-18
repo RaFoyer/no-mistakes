@@ -34,16 +34,20 @@ type Run struct {
 	// ParkedMS accumulates the run's total parked-at-gate wall time in
 	// milliseconds across every gate wait (local performance telemetry;
 	// step duration_ms values exclude this time).
-	ParkedMS        int64
-	Intent          *string
-	IntentSource    *string
-	IntentSessionID *string
-	IntentScore     *float64
-	CreatedAt       int64
-	UpdatedAt       int64
+	ParkedMS int64
+	// RequiresGitHubPublicationProfile is private durable custody state. It
+	// records only that an explicitly selected per-run profile is required;
+	// the profile path itself remains process-local and is never persisted.
+	RequiresGitHubPublicationProfile bool
+	Intent                           *string
+	IntentSource                     *string
+	IntentSessionID                  *string
+	IntentScore                      *float64
+	CreatedAt                        int64
+	UpdatedAt                        int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, status, provisioning_phase, provisioning_progress, provisioning_error, provisioning_started_at, provisioning_completed_at, pr_url, error, blocked_reason, awaiting_agent_since, COALESCE(parked_ms, 0), intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, status, provisioning_phase, provisioning_progress, provisioning_error, provisioning_started_at, provisioning_completed_at, pr_url, error, blocked_reason, awaiting_agent_since, COALESCE(parked_ms, 0), COALESCE(requires_github_publication_profile, 0), intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
@@ -51,30 +55,42 @@ func scanRun(row interface {
 	return row.Scan(
 		&r.ID, &r.RepoID, &r.Branch, &r.HeadSHA, &r.BaseSHA, &r.Status,
 		&r.ProvisioningPhase, &r.ProvisioningProgress, &r.ProvisioningError, &r.ProvisioningStartedAt, &r.ProvisioningCompletedAt,
-		&r.PRURL, &r.Error, &r.BlockedReason, &r.AwaitingAgentSince, &r.ParkedMS,
+		&r.PRURL, &r.Error, &r.BlockedReason, &r.AwaitingAgentSince, &r.ParkedMS, &r.RequiresGitHubPublicationProfile,
 		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
 }
 
+// InsertRunOptions contains private admission-only state that must become
+// durable atomically with the run row.
+type InsertRunOptions struct {
+	RequiresGitHubPublicationProfile bool
+}
+
 // InsertRun creates a new run record.
 func (d *DB) InsertRun(repoID, branch, headSHA, baseSHA string) (*Run, error) {
+	return d.InsertRunWithOptions(repoID, branch, headSHA, baseSHA, InsertRunOptions{})
+}
+
+// InsertRunWithOptions creates a new run record with private admission state.
+func (d *DB) InsertRunWithOptions(repoID, branch, headSHA, baseSHA string, opts InsertRunOptions) (*Run, error) {
 	ts := now()
 	r := &Run{
-		ID:                newID(),
-		RepoID:            repoID,
-		Branch:            branch,
-		HeadSHA:           headSHA,
-		BaseSHA:           baseSHA,
-		Status:            types.RunPending,
-		CreatedAt:         ts,
-		UpdatedAt:         ts,
-		ProvisioningPhase: "created",
+		ID:                               newID(),
+		RepoID:                           repoID,
+		Branch:                           branch,
+		HeadSHA:                          headSHA,
+		BaseSHA:                          baseSHA,
+		Status:                           types.RunPending,
+		CreatedAt:                        ts,
+		UpdatedAt:                        ts,
+		ProvisioningPhase:                "created",
+		RequiresGitHubPublicationProfile: opts.RequiresGitHubPublicationProfile,
 	}
 	err := d.withLifecycleTx(func(tx *sql.Tx) error {
 		if _, err := tx.Exec(
-			`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, r.Status, r.CreatedAt, r.UpdatedAt,
+			`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, requires_github_publication_profile, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, r.Status, r.RequiresGitHubPublicationProfile, r.CreatedAt, r.UpdatedAt,
 		); err != nil {
 			return fmt.Errorf("insert run: %w", err)
 		}

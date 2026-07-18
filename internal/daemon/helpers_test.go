@@ -108,6 +108,17 @@ type mockPassStep struct {
 	execCnt atomic.Int32
 }
 
+type mockEnvCaptureStep struct {
+	name types.StepName
+	env  chan []string
+}
+
+func (s *mockEnvCaptureStep) Name() types.StepName { return s.name }
+func (s *mockEnvCaptureStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, error) {
+	s.env <- append([]string(nil), sctx.Env...)
+	return &pipeline.StepOutcome{}, nil
+}
+
 func (s *mockPassStep) Name() types.StepName { return s.name }
 func (s *mockPassStep) Execute(_ *pipeline.StepContext) (*pipeline.StepOutcome, error) {
 	s.execCnt.Add(1)

@@ -440,12 +440,16 @@ func TestConfigErrorForFreshAxiRunAllowsReattach(t *testing.T) {
 }
 
 func TestRerunParamsIncludeSkipSteps(t *testing.T) {
+	t.Setenv("GH_CONFIG_DIR", "/profiles/acos")
 	params := rerunParams("repo-1", "feature/x", []types.StepName{types.StepReview}, "user goal")
 	if params.RepoID != "repo-1" || params.Branch != "feature/x" || params.Intent != "user goal" {
 		t.Fatalf("unexpected rerun params: %#v", params)
 	}
 	if len(params.SkipSteps) != 1 || params.SkipSteps[0] != types.StepReview {
 		t.Fatalf("SkipSteps = %#v, want review", params.SkipSteps)
+	}
+	if params.GitHubConfigDir == nil || *params.GitHubConfigDir != "/profiles/acos" {
+		t.Fatalf("GitHubConfigDir = %#v, want selected profile", params.GitHubConfigDir)
 	}
 }
 

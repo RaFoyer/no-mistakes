@@ -115,7 +115,7 @@ When the upstream hostname carries no `gitlab` marker, no-mistakes reads glab's 
 
 ## `GH_CONFIG_DIR`
 
-Directory holding gh's `hosts.yml`, consulted when detecting self-hosted GitHub Enterprise.
+Directory holding gh's configuration, used for GitHub host detection and an explicitly selected run's PR/CI commands.
 
 |         |          |
 | ------- | -------- |
@@ -123,6 +123,10 @@ Directory holding gh's `hosts.yml`, consulted when detecting self-hosted GitHub 
 | Default | (none)   |
 
 When the upstream hostname is not `github.com`, no-mistakes reads gh's configured hosts from `$GH_CONFIG_DIR/hosts.yml` to decide whether the host is a GitHub Enterprise instance. It takes precedence over `XDG_CONFIG_HOME`. See [Provider Integration](/no-mistakes/guides/provider-integration/#self-hosted-githubgitlab).
+
+When `GH_CONFIG_DIR` is explicitly present in a process that starts a gate push or agent-driven rerun, no-mistakes transports only its directory path reference through the local hook and daemon. The daemon canonicalizes the reference without reading files inside the directory, holds it in memory for that run, and supplies it only to the GitHub PR and CI subprocesses. Review, test, document, lint, push, and agent subprocesses do not receive the invocation-specific value. The path is not stored in the run database, returned by status APIs, included in telemetry, or written to logs. The database stores only a private boolean saying that the run requires its selected publication profile; if a daemon restart loses the in-memory reference, GitHub PR/CI publication fails closed before invoking the host CLI. Runs without an explicit selection retain their normal restart behavior.
+
+An explicitly selected value must resolve to an absolute existing directory. Empty, relative, malformed, missing, and non-directory selections reject the run with a value-safe error instead of falling back to another gh profile. When the variable is absent, publication retains the normal gh configuration behavior.
 
 ## `XDG_CONFIG_HOME`
 

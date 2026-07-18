@@ -41,6 +41,9 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if !hasColumn(t, d, "repos", "fork_url") {
 		t.Fatal("repos.fork_url column missing from fresh schema")
 	}
+	if !hasColumn(t, d, "runs", "requires_github_publication_profile") {
+		t.Fatal("runs.requires_github_publication_profile column missing from fresh schema")
+	}
 	for _, column := range []string{"last_activity_at", "last_activity", "agent_pid"} {
 		if !hasColumn(t, d, "step_results", column) {
 			t.Fatalf("step_results.%s column missing from fresh schema", column)

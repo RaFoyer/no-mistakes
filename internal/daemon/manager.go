@@ -351,7 +351,7 @@ func (m *RunManager) resumeProvisioningRuns(runs []*db.Run) {
 				telemetry.Track("run", telemetry.Fields{"action": "start_failed", "trigger": "restart", "branch_role": branchRole, "stage": stage})
 			}
 			var err error
-			launched, err = m.provisionRun(ctx, repo, run.Branch, run.HeadSHA, run.BaseSHA, "restart", nil, run, branchRole, track, done)
+			launched, err = m.provisionRun(ctx, repo, run.Branch, run.HeadSHA, run.BaseSHA, "restart", nil, nil, run, branchRole, track, done)
 			if err != nil {
 				if cause := context.Cause(ctx); cause != nil {
 					_ = m.db.UpdateRunErrorStatus(run.ID, cause.Error(), types.RunCancelled)
@@ -372,6 +372,9 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	}
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, plan.cfg, plan.agent, plan.steps, m.broadcast)
+	if plan.run.RequiresGitHubPublicationProfile {
+		executor.RequireGitHubPublicationProfile()
+	}
 	executor.SetRouteContext(plan.repo.UpstreamURL, routing.ConfigFingerprint(
 		string(plan.cfg.Agent), strings.Join(agentNames(plan.cfg.Agents), ","),
 		plan.cfg.RoutingGeneration, plan.cfg.AgentPathFor(plan.cfg.Agent)), plan.cfg.RoutingGeneration)
@@ -634,12 +637,12 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 	}
 
 	branch := branchFromRef(params.Ref)
-	return m.startRun(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent)
+	return m.startRun(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent, params.GitHubConfigDir)
 }
 
 // HandleRerun creates a new run for the latest gate head on a branch. An
 // optional intent is stamped onto the new run.
-func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch string, skipSteps []types.StepName, intent string) (string, error) {
+func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch string, skipSteps []types.StepName, intent string, githubConfigDir *string) (string, error) {
 	repo, err := m.db.GetRepo(repoID)
 	if err != nil {
 		return "", fmt.Errorf("get repo: %w", err)
@@ -682,14 +685,37 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch string, ski
 		baseSHA = matchingHead.BaseSHA
 	}
 
-	return m.startRun(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent)
+	return m.startRun(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, githubConfigDir)
+}
+
+const githubPublicationProfileUnavailable = pipeline.GitHubPublicationProfileUnavailable
+
+// normalizeSelectedGitHubConfigDir canonicalizes only filesystem metadata. It
+// never opens or reads files inside the selected gh profile directory.
+func normalizeSelectedGitHubConfigDir(selected *string) (*string, error) {
+	if selected == nil {
+		return nil, nil
+	}
+	raw := *selected
+	if raw == "" || raw != strings.TrimSpace(raw) || strings.ContainsAny(raw, "\x00\r\n") || !filepath.IsAbs(raw) {
+		return nil, fmt.Errorf(githubPublicationProfileUnavailable)
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(raw))
+	if err != nil {
+		return nil, fmt.Errorf(githubPublicationProfileUnavailable)
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return nil, fmt.Errorf(githubPublicationProfileUnavailable)
+	}
+	return &resolved, nil
 }
 
 // startRun admits a run and returns after durable provisioning has been
 // queued. Worktree checkout, trusted-config loading, and agent construction
 // run outside the IPC request so slow repositories cannot hold the daemon
 // request open.
-func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent string) (string, error) {
+func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent string, githubConfigDir *string) (string, error) {
 	// Keep the read side held through branch-lock admission and wg.Add. This
 	// prevents Shutdown from completing its Wait while an already-admitted
 	// caller is still able to launch provisioning.
@@ -709,6 +735,11 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 		trackStartFailure("daemon_shutdown")
 		return "", fmt.Errorf("daemon is shutting down")
 	}
+	githubConfigDir, err := normalizeSelectedGitHubConfigDir(githubConfigDir)
+	if err != nil {
+		trackStartFailure("github_publication_profile")
+		return "", err
+	}
 
 	// Serialize only admission. Provisioning itself is bounded separately and
 	// must not hold this lock for the duration of a checkout.
@@ -719,7 +750,9 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 	defer branchMu.Unlock()
 
 	m.cancelActiveRuns(repo.ID, branch)
-	run, err := m.db.InsertRun(repo.ID, branch, headSHA, baseSHA)
+	run, err := m.db.InsertRunWithOptions(repo.ID, branch, headSHA, baseSHA, db.InsertRunOptions{
+		RequiresGitHubPublicationProfile: githubConfigDir != nil,
+	})
 	if err != nil {
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
@@ -783,7 +816,7 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 		}
 		defer func() { <-m.provisionSlots }()
 		var err error
-		launched, err = m.provisionRun(provisionCtx, repo, branch, headSHA, baseSHA, trigger, skipSteps, run, branchRole, trackStartFailure, done)
+		launched, err = m.provisionRun(provisionCtx, repo, branch, headSHA, baseSHA, trigger, skipSteps, githubConfigDir, run, branchRole, trackStartFailure, done)
 		if err != nil {
 			if cause := context.Cause(provisionCtx); cause != nil {
 				_ = m.db.UpdateRunErrorStatus(run.ID, cause.Error(), types.RunCancelled)
@@ -796,7 +829,7 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 	return run.ID, nil
 }
 
-func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, run *db.Run, branchRole string, trackStartFailure func(string), done chan struct{}) (bool, error) {
+func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, githubConfigDir *string, run *db.Run, branchRole string, trackStartFailure func(string), done chan struct{}) (bool, error) {
 	if err := m.db.SetRunProvisioning(run.ID, "worktree", 5, ""); err != nil {
 		return false, err
 	}
@@ -960,6 +993,12 @@ func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, he
 	// Create executor with event broadcast.
 	runCtx, cancel := context.WithCancelCause(context.Background())
 	executor := pipeline.NewExecutor(m.db, m.paths, cfg, ag, execSteps, m.broadcast)
+	if run.RequiresGitHubPublicationProfile {
+		executor.RequireGitHubPublicationProfile()
+	}
+	if githubConfigDir != nil {
+		executor.SetGitHubPublicationConfigDir(*githubConfigDir)
+	}
 	executor.SetRouteContext(repo.UpstreamURL, routing.ConfigFingerprint(
 		string(cfg.Agent), strings.Join(agentNames(cfg.Agents), ","),
 		cfg.RoutingGeneration, cfg.AgentPathFor(cfg.Agent)), cfg.RoutingGeneration)

@@ -376,6 +376,40 @@ func TestStepCLIAvailable_ResolvesExecutableSuffixFromCustomPath(t *testing.T) {
 	}
 }
 
+func TestStepCmd_PassesSelectedGitHubProfileWithoutLoggingOrReadingContents(t *testing.T) {
+	binDir := fakeCLIBinDir(t)
+	logFile := filepath.Join(t.TempDir(), "gh.log")
+	linkTestBinary(t, binDir, "gh")
+
+	profileDir := t.TempDir()
+	credentialSentinel := "credential-material-must-not-be-read"
+	if err := os.WriteFile(filepath.Join(profileDir, "hosts.yml"), []byte(credentialSentinel), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GH_CONFIG_DIR", filepath.Join(t.TempDir(), "ambient-profile"))
+	sctx := &pipeline.StepContext{
+		Ctx:     context.Background(),
+		WorkDir: t.TempDir(),
+		Env: fakeCLIEnv(binDir, map[string]string{
+			"FAKE_CLI_MODE":                 "gh",
+			"FAKE_CLI_LOG":                  logFile,
+			"FAKE_CLI_EXPECT_GH_CONFIG_DIR": profileDir,
+			"GH_CONFIG_DIR":                 profileDir,
+		}),
+	}
+
+	if !stepAuthConfigured(sctx, scm.ProviderGitHub) {
+		t.Fatal("expected fake gh auth check to receive selected profile")
+	}
+	logData, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(logData), profileDir) || strings.Contains(string(logData), credentialSentinel) {
+		t.Fatalf("fake gh log exposed profile path or contents: %q", string(logData))
+	}
+}
+
 func TestStepCLIAvailable_IgnoresNonExecutableFromCustomPath(t *testing.T) {
 	t.Parallel()
 
