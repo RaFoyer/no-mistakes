@@ -105,6 +105,9 @@ func (m *RunManager) recoverableParkedRuns(ctx context.Context) []recoveredRunPl
 		}
 		plan, err := m.prepareRecoveredRun(ctx, run)
 		if err != nil {
+			if run.RequiresCodexStateRoot {
+				_ = m.db.UpdateRunErrorStatus(run.ID, codexStateRootUnavailable, types.RunFailed)
+			}
 			slog.Warn("active run cannot be safely resumed", "run_id", run.ID, "error", err)
 			continue
 		}
@@ -116,6 +119,9 @@ func (m *RunManager) recoverableParkedRuns(ctx context.Context) []recoveredRunPl
 func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*recoveredRunPlan, error) {
 	if run == nil || (run.Status == types.RunRunning && run.AwaitingAgentSince == nil) || (run.Status != types.RunRunning && run.Status != types.RunAwaitingAuth) || run.Branch == "" {
 		return nil, fmt.Errorf("run is not a parked running run")
+	}
+	if _, err := codexStateRootForRun(run, nil); err != nil {
+		return nil, err
 	}
 	repo, err := m.db.GetRepo(run.RepoID)
 	if err != nil {
@@ -233,15 +239,20 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, lookPath func(str
 	}
 	created := make([]agent.Agent, 0, len(agents))
 	for _, name := range agents {
-		next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agent.Options{
+		agentOptions := agent.Options{
 			ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
 			DisableProjectSettings: cfg.DisableProjectSettings,
-		})
+			IsolateCodexHome:       name == types.AgentCodex,
+		}
+		next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agentOptions)
 		if err != nil {
 			for _, existing := range created {
 				_ = existing.Close()
 			}
 			return nil, fmt.Errorf("create agent %s: %w", name, err)
+		}
+		if name != types.AgentCodex {
+			next = agent.WithCodexHomeIsolation(next)
 		}
 		created = append(created, agent.WithSteering(next))
 	}
@@ -351,7 +362,7 @@ func (m *RunManager) resumeProvisioningRuns(runs []*db.Run) {
 				telemetry.Track("run", telemetry.Fields{"action": "start_failed", "trigger": "restart", "branch_role": branchRole, "stage": stage})
 			}
 			var err error
-			launched, err = m.provisionRun(ctx, repo, run.Branch, run.HeadSHA, run.BaseSHA, "restart", nil, nil, run, branchRole, track, done)
+			launched, err = m.provisionRun(ctx, repo, run.Branch, run.HeadSHA, run.BaseSHA, "restart", nil, nil, nil, run, branchRole, track, done)
 			if err != nil {
 				if cause := context.Cause(ctx); cause != nil {
 					_ = m.db.UpdateRunErrorStatus(run.ID, cause.Error(), types.RunCancelled)
@@ -637,12 +648,12 @@ func (m *RunManager) HandlePushReceived(ctx context.Context, params *ipc.PushRec
 	}
 
 	branch := branchFromRef(params.Ref)
-	return m.startRun(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent, params.GitHubConfigDir)
+	return m.startRun(ctx, repo, branch, params.New, params.Old, "push", params.SkipSteps, params.Intent, params.GitHubConfigDir, params.CodexStateRoot)
 }
 
 // HandleRerun creates a new run for the latest gate head on a branch. An
 // optional intent is stamped onto the new run.
-func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch string, skipSteps []types.StepName, intent string, githubConfigDir *string) (string, error) {
+func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch string, skipSteps []types.StepName, intent string, githubConfigDir, codexStateRoot *string) (string, error) {
 	repo, err := m.db.GetRepo(repoID)
 	if err != nil {
 		return "", fmt.Errorf("get repo: %w", err)
@@ -685,7 +696,7 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch string, ski
 		baseSHA = matchingHead.BaseSHA
 	}
 
-	return m.startRun(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, githubConfigDir)
+	return m.startRun(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent, githubConfigDir, codexStateRoot)
 }
 
 const githubPublicationProfileUnavailable = pipeline.GitHubPublicationProfileUnavailable
@@ -715,7 +726,7 @@ func normalizeSelectedGitHubConfigDir(selected *string) (*string, error) {
 // queued. Worktree checkout, trusted-config loading, and agent construction
 // run outside the IPC request so slow repositories cannot hold the daemon
 // request open.
-func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent string, githubConfigDir *string) (string, error) {
+func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, intent string, githubConfigDir, codexStateRoot *string) (string, error) {
 	// Keep the read side held through branch-lock admission and wg.Add. This
 	// prevents Shutdown from completing its Wait while an already-admitted
 	// caller is still able to launch provisioning.
@@ -740,6 +751,11 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 		trackStartFailure("github_publication_profile")
 		return "", err
 	}
+	codexStateRoot, err = normalizeSelectedCodexStateRoot(codexStateRoot)
+	if err != nil {
+		trackStartFailure("codex_state_root")
+		return "", err
+	}
 
 	// Serialize only admission. Provisioning itself is bounded separately and
 	// must not hold this lock for the duration of a checkout.
@@ -752,6 +768,7 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 	m.cancelActiveRuns(repo.ID, branch)
 	run, err := m.db.InsertRunWithOptions(repo.ID, branch, headSHA, baseSHA, db.InsertRunOptions{
 		RequiresGitHubPublicationProfile: githubConfigDir != nil,
+		RequiresCodexStateRoot:           codexStateRoot != nil,
 	})
 	if err != nil {
 		trackStartFailure("create_run")
@@ -816,7 +833,7 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 		}
 		defer func() { <-m.provisionSlots }()
 		var err error
-		launched, err = m.provisionRun(provisionCtx, repo, branch, headSHA, baseSHA, trigger, skipSteps, githubConfigDir, run, branchRole, trackStartFailure, done)
+		launched, err = m.provisionRun(provisionCtx, repo, branch, headSHA, baseSHA, trigger, skipSteps, githubConfigDir, codexStateRoot, run, branchRole, trackStartFailure, done)
 		if err != nil {
 			if cause := context.Cause(provisionCtx); cause != nil {
 				_ = m.db.UpdateRunErrorStatus(run.ID, cause.Error(), types.RunCancelled)
@@ -829,7 +846,12 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 	return run.ID, nil
 }
 
-func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, githubConfigDir *string, run *db.Run, branchRole string, trackStartFailure func(string), done chan struct{}) (bool, error) {
+func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, headSHA, baseSHA, trigger string, skipSteps []types.StepName, githubConfigDir, selectedCodexStateRoot *string, run *db.Run, branchRole string, trackStartFailure func(string), done chan struct{}) (bool, error) {
+	codexStateRoot, err := codexStateRootForRun(run, selectedCodexStateRoot)
+	if err != nil {
+		trackStartFailure("codex_state_root")
+		return false, err
+	}
 	if err := m.db.SetRunProvisioning(run.ID, "worktree", 5, ""); err != nil {
 		return false, err
 	}
@@ -942,14 +964,22 @@ func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, he
 		}
 		created := make([]agent.Agent, 0, len(agents))
 		for _, name := range agents {
-			next, agErr := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agent.Options{
+			agentOptions := agent.Options{
 				ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
 				DisableProjectSettings: cfg.DisableProjectSettings,
-			})
+				IsolateCodexHome:       name == types.AgentCodex,
+			}
+			if name == types.AgentCodex {
+				agentOptions.CodexStateRoot = codexStateRoot
+			}
+			next, agErr := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agentOptions)
 			if agErr != nil {
 				m.db.UpdateRunError(run.ID, fmt.Sprintf("create agent %s: %s", name, agErr))
 				trackStartFailure("create_agent")
 				return false, fmt.Errorf("create agent %s: %w", name, agErr)
+			}
+			if name != types.AgentCodex {
+				next = agent.WithCodexHomeIsolation(next)
 			}
 			// Steer every pipeline agent to keep writes inside the worktree and
 			// avoid mutating system state (e.g. brew/Homebrew touching

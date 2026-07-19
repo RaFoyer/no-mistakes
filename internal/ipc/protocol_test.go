@@ -3,6 +3,7 @@ package ipc
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -125,6 +126,7 @@ func TestResponseError(t *testing.T) {
 
 func TestPushReceivedParams(t *testing.T) {
 	githubConfigDir := "/profiles/acos"
+	codexStateRoot := "/private/codex-run"
 	params := PushReceivedParams{
 		Gate:            "/path/to/gate.git",
 		Ref:             "refs/heads/main",
@@ -132,6 +134,7 @@ func TestPushReceivedParams(t *testing.T) {
 		New:             "bbb",
 		SkipSteps:       []types.StepName{types.StepTest, types.StepLint},
 		GitHubConfigDir: &githubConfigDir,
+		CodexStateRoot:  &codexStateRoot,
 	}
 	data, _ := json.Marshal(params)
 	var got PushReceivedParams
@@ -146,6 +149,9 @@ func TestPushReceivedParams(t *testing.T) {
 	}
 	if got.GitHubConfigDir == nil || *got.GitHubConfigDir != githubConfigDir {
 		t.Fatalf("github_config_dir = %#v, want %q", got.GitHubConfigDir, githubConfigDir)
+	}
+	if got.CodexStateRoot == nil || *got.CodexStateRoot != codexStateRoot {
+		t.Fatalf("codex_state_root = %#v, want %q", got.CodexStateRoot, codexStateRoot)
 	}
 }
 
@@ -187,7 +193,8 @@ func TestGetActiveRunParams(t *testing.T) {
 
 func TestRerunParams(t *testing.T) {
 	githubConfigDir := "/profiles/acos"
-	params := RerunParams{RepoID: "repo456", Branch: "feature", SkipSteps: []types.StepName{types.StepReview}, GitHubConfigDir: &githubConfigDir}
+	codexStateRoot := "/private/codex-run"
+	params := RerunParams{RepoID: "repo456", Branch: "feature", SkipSteps: []types.StepName{types.StepReview}, GitHubConfigDir: &githubConfigDir, CodexStateRoot: &codexStateRoot}
 	data, _ := json.Marshal(params)
 	var got RerunParams
 	if err := json.Unmarshal(data, &got); err != nil {
@@ -204,6 +211,20 @@ func TestRerunParams(t *testing.T) {
 	}
 	if got.GitHubConfigDir == nil || *got.GitHubConfigDir != githubConfigDir {
 		t.Fatalf("github_config_dir = %#v, want %q", got.GitHubConfigDir, githubConfigDir)
+	}
+	if got.CodexStateRoot == nil || *got.CodexStateRoot != codexStateRoot {
+		t.Fatalf("codex_state_root = %#v, want %q", got.CodexStateRoot, codexStateRoot)
+	}
+}
+
+func TestRunInfoDoesNotProjectCodexStateRootCustody(t *testing.T) {
+	root := "/private/codex-run"
+	data, err := json.Marshal(RunInfo{ID: "run-1", Branch: "feature"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), root) || strings.Contains(string(data), "codex_state_root") || strings.Contains(string(data), "requires_codex_state_root") {
+		t.Fatalf("run projection exposed private Codex state-root custody: %s", data)
 	}
 }
 

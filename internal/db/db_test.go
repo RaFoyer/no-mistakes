@@ -44,10 +44,37 @@ func TestOpenCreatesSchema(t *testing.T) {
 	if !hasColumn(t, d, "runs", "requires_github_publication_profile") {
 		t.Fatal("runs.requires_github_publication_profile column missing from fresh schema")
 	}
+	if !hasColumn(t, d, "runs", "requires_codex_state_root") {
+		t.Fatal("runs.requires_codex_state_root column missing from fresh schema")
+	}
 	for _, column := range []string{"last_activity_at", "last_activity", "agent_pid"} {
 		if !hasColumn(t, d, "step_results", column) {
 			t.Fatalf("step_results.%s column missing from fresh schema", column)
 		}
+	}
+}
+
+func TestOpenMigratesCodexStateRootRequirement(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy.sqlite")
+	legacy, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE runs (id TEXT PRIMARY KEY)`); err != nil {
+		legacy.Close()
+		t.Fatal(err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	if !hasColumn(t, d, "runs", "requires_codex_state_root") {
+		t.Fatal("legacy runs table was not migrated with private Codex state-root recovery state")
 	}
 }
 

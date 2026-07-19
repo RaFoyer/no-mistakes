@@ -284,6 +284,12 @@ type InvocationWorkload struct {
 // ACPRegistryOverrides maps acpx target names to raw ACP agent commands.
 type Options struct {
 	ACPRegistryOverrides map[string]string
+	// CodexStateRoot is a validated, process-local per-run CODEX_HOME. Only the
+	// native Codex adapter receives it; every other adapter is unchanged.
+	CodexStateRoot string
+	// IsolateCodexHome prevents a managed Codex adapter from falling back to
+	// the daemon's ambient CODEX_HOME when no per-run root is available.
+	IsolateCodexHome bool
 	// DisableProjectSettings, when true, asks a supported adapter (codex,
 	// claude) to launch with the target repo's project-level agent
 	// settings/instructions suppressed. It is the resolved, trusted-only opt-out
@@ -838,7 +844,7 @@ func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts O
 	case types.AgentClaude:
 		return &claudeAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
 	case types.AgentCodex:
-		return &codexAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
+		return &codexAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, stateRoot: opts.CodexStateRoot, isolateCodexHome: opts.IsolateCodexHome}, nil
 	case types.AgentRovoDev:
 		return &rovodevAgent{bin: bin, extraArgs: extraArgs}, nil
 	case types.AgentOpenCode:

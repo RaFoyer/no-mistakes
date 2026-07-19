@@ -20,8 +20,10 @@ import (
 
 // codexAgent spawns the codex CLI for each invocation.
 type codexAgent struct {
-	bin       string
-	extraArgs []string
+	bin              string
+	extraArgs        []string
+	stateRoot        string
+	isolateCodexHome bool
 	// disableProjectSettings is the resolved, trusted-only opt-out. When true,
 	// buildArgs suppresses codex's project-level settings/instructions surface.
 	disableProjectSettings bool
@@ -97,7 +99,7 @@ func (a *codexAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error)
 	// supplied. Keeping the full payload out of argv avoids macOS E2BIG and
 	// keeps process listings free of source and test evidence.
 	cmd.Stdin = strings.NewReader(opts.Prompt)
-	cmd.Env = gitSafeEnv(opts.CWD)
+	cmd.Env = codexProcessEnv(opts.CWD, a.stateRoot, a.isolateCodexHome)
 	shellenv.ConfigureShellCommand(cmd)
 
 	var stderrBuf []byte

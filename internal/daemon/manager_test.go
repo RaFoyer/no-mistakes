@@ -139,6 +139,355 @@ func TestNormalizeSelectedGitHubConfigDirFailsClosedValueSafely(t *testing.T) {
 	}
 }
 
+func secureCodexStateRoot(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(resolved, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
+func requireEffectiveUID(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() < 0 {
+		t.Skip("effective uid metadata is unavailable")
+	}
+}
+
+func TestNormalizeSelectedCodexStateRootUsesMetadataOnly(t *testing.T) {
+	requireEffectiveUID(t)
+	if got, err := normalizeSelectedCodexStateRoot(nil); err != nil || got != nil {
+		t.Fatalf("unselected root = %#v, %v; want nil, nil", got, err)
+	}
+
+	root := secureCodexStateRoot(t)
+	secret := filepath.Join(root, "must-not-be-opened")
+	if err := os.WriteFile(secret, []byte("credential-material-must-not-be-read"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	got, err := normalizeSelectedCodexStateRoot(&root)
+	if err != nil {
+		t.Fatalf("valid state root: %v", err)
+	}
+	if got == nil || *got != filepath.Clean(root) {
+		t.Fatalf("valid state root = %#v, want %q", got, filepath.Clean(root))
+	}
+}
+
+func TestNormalizeSelectedCodexStateRootFailsClosedValueSafely(t *testing.T) {
+	base := secureCodexStateRoot(t)
+	missing := filepath.Join(base, "private-state-name")
+	nonDirectory := filepath.Join(base, "state-file")
+	if err := os.WriteFile(nonDirectory, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	wrongMode := filepath.Join(base, "wrong-mode")
+	if err := os.Mkdir(wrongMode, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{name: "empty", value: ""},
+		{name: "relative", value: "relative/state"},
+		{name: "leading-space", value: " " + missing},
+		{name: "newline", value: "bad\npath"},
+		{name: "unicode-control", value: "bad\u0085path"},
+		{name: "nul", value: "bad\x00path"},
+		{name: "missing", value: missing},
+		{name: "non-directory", value: nonDirectory},
+		{name: "wrong-mode", value: wrongMode},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			value := tc.value
+			got, err := normalizeSelectedCodexStateRoot(&value)
+			if err == nil || got != nil {
+				t.Fatalf("normalize(%q) = %#v, %v; want nil error", value, got, err)
+			}
+			if err.Error() != codexStateRootUnavailable {
+				t.Fatalf("error = %q, want constant value-safe error", err)
+			}
+			if value != "" && strings.Contains(err.Error(), value) {
+				t.Fatalf("error exposed selected path: %v", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeSelectedCodexStateRootRejectsSpecialModeBits(t *testing.T) {
+	root := secureCodexStateRoot(t)
+	if err := os.Chmod(root, 0o1700); err != nil {
+		t.Skipf("set sticky mode: %v", err)
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSticky == 0 {
+		t.Skip("filesystem did not retain sticky mode")
+	}
+	if got, err := normalizeSelectedCodexStateRoot(&root); err == nil || got != nil || err.Error() != codexStateRootUnavailable {
+		t.Fatalf("special-mode root normalized to %#v with error %v; want constant rejection", got, err)
+	}
+}
+
+func TestNormalizeSelectedCodexStateRootRejectsFinalAndAncestorSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink fixture requires privileges on Windows")
+	}
+	base := secureCodexStateRoot(t)
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	finalLink := filepath.Join(base, "final-link")
+	if err := os.Symlink(target, finalLink); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(target, "child")
+	if err := os.Mkdir(child, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ancestorLink := filepath.Join(base, "ancestor-link")
+	if err := os.Symlink(target, ancestorLink); err != nil {
+		t.Fatal(err)
+	}
+	viaAncestor := filepath.Join(ancestorLink, "child")
+	viaCollapsedAncestor := ancestorLink + string(os.PathSeparator) + ".." + string(os.PathSeparator) + "target"
+
+	for _, value := range []string{finalLink, viaAncestor, viaCollapsedAncestor} {
+		value := value
+		if got, err := normalizeSelectedCodexStateRoot(&value); err == nil || got != nil || err.Error() != codexStateRootUnavailable {
+			t.Fatalf("symlink path normalized to %#v with error %v; want constant rejection", got, err)
+		}
+	}
+}
+
+type ownerOverrideFileInfo struct {
+	os.FileInfo
+	metadata any
+}
+
+func (i ownerOverrideFileInfo) Sys() any { return i.metadata }
+
+func TestCodexStateRootOwnershipMustMatchEffectiveUser(t *testing.T) {
+	if os.Geteuid() < 0 {
+		t.Skip("effective uid metadata is unavailable")
+	}
+	root := secureCodexStateRoot(t)
+	info, err := os.Lstat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ownedByEffectiveUser(info) {
+		t.Fatal("current-user directory was not recognized as owned")
+	}
+	wrongOwner := ownerOverrideFileInfo{
+		FileInfo: info,
+		metadata: &struct{ Uid uint32 }{Uid: uint32(os.Geteuid() + 1)},
+	}
+	if ownedByEffectiveUser(wrongOwner) {
+		t.Fatal("different-owner metadata was accepted")
+	}
+}
+
+func TestCodexStateRootRecoveryRequirementFailsClosedWithoutAmbientSubstitution(t *testing.T) {
+	t.Setenv("CODEX_HOME", secureCodexStateRoot(t))
+	required := &db.Run{RequiresCodexStateRoot: true}
+	if got, err := codexStateRootForRun(required, nil); err == nil || got != "" || err.Error() != codexStateRootUnavailable {
+		t.Fatalf("required recovery root = %q, %v; want constant fail-closed error", got, err)
+	}
+	unselected := &db.Run{}
+	if got, err := codexStateRootForRun(unselected, nil); err != nil || got != "" {
+		t.Fatalf("unselected recovery root = %q, %v; want absent selection allowed", got, err)
+	}
+}
+
+func TestPrepareRecoveredRunFailsClosedBeforeAgentCreationWhenCodexRootCustodyIsLost(t *testing.T) {
+	t.Setenv("CODEX_HOME", secureCodexStateRoot(t))
+	parkedAt := time.Now().Unix()
+	run := &db.Run{
+		Status:                 types.RunRunning,
+		AwaitingAgentSince:     &parkedAt,
+		Branch:                 "feature/recovery",
+		RequiresCodexStateRoot: true,
+	}
+	m := NewRunManager(nil, nil, nil)
+	plan, err := m.prepareRecoveredRun(context.Background(), run)
+	if err == nil || plan != nil || err.Error() != codexStateRootUnavailable {
+		t.Fatalf("recovered plan = %#v, %v; want value-safe failure before ambient agent creation", plan, err)
+	}
+}
+
+func TestPushReceivedRejectsInvalidCodexStateRootWithoutCreatingRun(t *testing.T) {
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step { return []pipeline.Step{&mockPassStep{name: types.StepReview}} })
+	_, headSHA := setupTestGitRepo(t, p, d, "invalid-codex-state-run-repo")
+	missing := filepath.Join(secureCodexStateRoot(t), "missing")
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var result ipc.PushReceivedResult
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir("invalid-codex-state-run-repo"), Ref: "refs/heads/main",
+		Old: strings.Repeat("0", 40), New: headSHA, CodexStateRoot: &missing,
+	}, &result)
+	if err == nil || err.Error() != codexStateRootUnavailable {
+		t.Fatalf("invalid state-root error = %v, want value-safe failure", err)
+	}
+	runs, err := d.GetRunsByRepo("invalid-codex-state-run-repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 0 {
+		t.Fatalf("invalid state root created %d runs, want 0", len(runs))
+	}
+}
+
+func TestPushReceivedKeepsCodexStateRootInMemoryAndOutOfSurfaces(t *testing.T) {
+	requireEffectiveUID(t)
+	recorder := &telemetryRecorder{}
+	restore := telemetry.SetDefaultForTesting(recorder)
+	defer restore()
+
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	})
+	_, headSHA := setupTestGitRepo(t, p, d, "codex-state-run-repo")
+	root := secureCodexStateRoot(t)
+	contents := "credential-material-must-not-be-read"
+	if err := os.WriteFile(filepath.Join(root, "state.json"), []byte(contents), 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	var result ipc.PushReceivedResult
+	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir("codex-state-run-repo"), Ref: "refs/heads/main",
+		Old: strings.Repeat("0", 40), New: headSHA, CodexStateRoot: &root,
+	}, &result); err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRunTerminalState(t, d, result.RunID)
+	if !run.RequiresCodexStateRoot {
+		t.Fatal("selected state-root run did not persist its private requirement boolean")
+	}
+	steps, err := d.GetStepsByRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projection, err := json.Marshal(runToInfo(d, run, steps))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertValueSafe := func(surface string, data []byte) {
+		t.Helper()
+		for _, forbidden := range []string{root, contents} {
+			if strings.Contains(string(data), forbidden) {
+				t.Fatalf("%s exposed private Codex state-root custody", surface)
+			}
+		}
+	}
+	assertValueSafe("status/read projection", projection)
+	if strings.Contains(string(projection), "requires_codex_state_root") {
+		t.Fatal("status/read projection exposed private recovery requirement")
+	}
+
+	if waitForTelemetryEvent(t, recorder, "run", "action", "finished") == nil {
+		t.Fatal("run did not emit terminal telemetry")
+	}
+	recorder.mu.Lock()
+	events := append([]recordedTelemetryEvent(nil), recorder.events...)
+	recorder.mu.Unlock()
+	for _, event := range events {
+		fields, err := json.Marshal(event.fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertValueSafe("telemetry", fields)
+	}
+
+	if err := filepath.Walk(p.Root(), func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		assertValueSafe("database/log/internal state", data)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRerunTransportsCodexStateRootAndValidatesBeforeCreation(t *testing.T) {
+	requireEffectiveUID(t)
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{&mockPassStep{name: types.StepReview}}
+	})
+	_, headSHA := setupTestGitRepo(t, p, d, "codex-state-rerun-repo")
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var first ipc.PushReceivedResult
+	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+		Gate: p.RepoDir("codex-state-rerun-repo"), Ref: "refs/heads/main",
+		Old: strings.Repeat("0", 40), New: headSHA,
+	}, &first); err != nil {
+		t.Fatal(err)
+	}
+	waitForRunTerminalState(t, d, first.RunID)
+
+	missing := filepath.Join(secureCodexStateRoot(t), "missing")
+	var invalid ipc.RerunResult
+	err = client.Call(ipc.MethodRerun, &ipc.RerunParams{
+		RepoID: "codex-state-rerun-repo", Branch: "main", CodexStateRoot: &missing,
+	}, &invalid)
+	if err == nil || err.Error() != codexStateRootUnavailable {
+		t.Fatalf("invalid rerun error = %v, want value-safe failure", err)
+	}
+	runs, err := d.GetRunsByRepo("codex-state-rerun-repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("invalid rerun created a row: got %d runs, want 1", len(runs))
+	}
+
+	root := secureCodexStateRoot(t)
+	var valid ipc.RerunResult
+	if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{
+		RepoID: "codex-state-rerun-repo", Branch: "main", CodexStateRoot: &root,
+	}, &valid); err != nil {
+		t.Fatal(err)
+	}
+	run := waitForRunTerminalState(t, d, valid.RunID)
+	if !run.RequiresCodexStateRoot {
+		t.Fatal("rerun did not retain the private state-root recovery requirement")
+	}
+}
+
 func TestPushReceivedScopesSelectedGitHubConfigDirToPublicationSteps(t *testing.T) {
 	recorder := &telemetryRecorder{}
 	restore := telemetry.SetDefaultForTesting(recorder)
@@ -629,7 +978,7 @@ func TestStartRunReturnsWhileProvisionerBlockedThirtySeconds(t *testing.T) {
 	t.Cleanup(m.Shutdown)
 
 	started := time.Now()
-	runID, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil)
+	runID, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -682,14 +1031,14 @@ func TestProvisioningSupersessionWaitsForCancelledProvisioner(t *testing.T) {
 	}
 	t.Cleanup(m.Shutdown)
 
-	firstID, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil)
+	firstID, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	waitForChannel(t, firstBlocked, 5*time.Second, "first provisioning block")
 	secondDone := make(chan error, 1)
 	go func() {
-		_, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil)
+		_, err := m.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil, nil)
 		secondDone <- err
 	}()
 	waitForChannel(t, firstCancelled, 5*time.Second, "first provisioning cancel")
@@ -729,7 +1078,7 @@ func TestProvisioningWorkerSlotsBoundActiveSetup(t *testing.T) {
 	t.Cleanup(m.Shutdown)
 
 	for _, branch := range []string{"feature/one", "feature/two", "feature/three"} {
-		if _, err := m.startRun(context.Background(), repo, branch, headSHA, headSHA, "push", nil, "", nil); err != nil {
+		if _, err := m.startRun(context.Background(), repo, branch, headSHA, headSHA, "push", nil, "", nil, nil); err != nil {
 			t.Fatalf("start %s: %v", branch, err)
 		}
 	}

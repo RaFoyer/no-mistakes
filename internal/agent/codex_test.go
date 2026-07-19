@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/routing"
@@ -107,6 +108,54 @@ func TestCodexAgent_LargePromptUsesStdinAndBoundedArgv(t *testing.T) {
 	}
 	if strings.TrimSpace(string(got)) != "3145728" {
 		t.Fatalf("stdin prompt bytes = %q, want 3145728", got)
+	}
+}
+
+func TestCodexAgent_ConcurrentRunsKeepStateRootsIsolated(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix fake Codex fixture")
+	}
+	type invocation struct {
+		agent   *codexAgent
+		capture string
+		want    string
+		cwd     string
+	}
+	t.Setenv("CODEX_HOME", "/ambient/must-not-win")
+	invocations := make([]invocation, 2)
+	for i := range invocations {
+		binDir := t.TempDir()
+		capture := filepath.Join(binDir, "seen-state-root")
+		bin := writeFakeCodex(t, binDir, `#!/bin/sh
+printf '%s' "$CODEX_HOME" > "$(dirname "$0")/seen-state-root"
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}'
+`, "")
+		root := t.TempDir()
+		invocations[i] = invocation{agent: &codexAgent{bin: bin, stateRoot: root, isolateCodexHome: true}, capture: capture, want: root, cwd: t.TempDir()}
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(invocations))
+	for i := range invocations {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = invocations[i].agent.Run(context.Background(), RunOpts{Prompt: "work", CWD: invocations[i].cwd})
+		}(i)
+	}
+	wg.Wait()
+	for i, invocation := range invocations {
+		if errs[i] != nil {
+			t.Fatalf("run %d: %v", i, errs[i])
+		}
+		got, err := os.ReadFile(invocation.capture)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != invocation.want {
+			t.Fatalf("run %d state root = %q, want its own root", i, got)
+		}
 	}
 }
 

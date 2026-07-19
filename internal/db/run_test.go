@@ -64,6 +64,37 @@ func TestRunPersistsOnlyGitHubPublicationProfileRequirement(t *testing.T) {
 	}
 }
 
+func TestRunPersistsOnlyCodexStateRootRequirement(t *testing.T) {
+	d := openTestDB(t)
+	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")
+
+	selected, err := d.InsertRunWithOptions(repo.ID, "selected", "abc123", "def456", InsertRunOptions{
+		RequiresCodexStateRoot: true,
+	})
+	if err != nil {
+		t.Fatalf("insert selected-state run: %v", err)
+	}
+	unselected, err := d.InsertRun(repo.ID, "unselected", "abc124", "def456")
+	if err != nil {
+		t.Fatalf("insert unselected run: %v", err)
+	}
+
+	selected, err = d.GetRun(selected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unselected, err = d.GetRun(unselected.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !selected.RequiresCodexStateRoot {
+		t.Fatal("selected state-root requirement was not durable")
+	}
+	if unselected.RequiresCodexStateRoot {
+		t.Fatal("unselected run unexpectedly requires a Codex state root")
+	}
+}
+
 func TestRunAwaitingAgentSetAndClear(t *testing.T) {
 	d := openTestDB(t)
 	repo, _ := d.InsertRepo("/home/user/project", "git@github.com:user/project.git", "main")

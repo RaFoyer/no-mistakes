@@ -1,10 +1,24 @@
 package agent
 
 import (
+	"context"
 	"runtime"
 	"strings"
 	"testing"
 )
+
+type environmentCaptureAgent struct {
+	env map[string]string
+}
+
+func (a *environmentCaptureAgent) Name() string { return "claude" }
+
+func (a *environmentCaptureAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
+	a.env = resolveAgentEnv(nonCodexProcessEnv(ctx, opts.CWD))
+	return &Result{}, nil
+}
+
+func (a *environmentCaptureAgent) Close() error { return nil }
 
 func resolveAgentEnv(env []string) map[string]string {
 	m := map[string]string{}
@@ -76,5 +90,69 @@ func TestGitSafeEnv_GateMarkerWinsOverAmbient(t *testing.T) {
 	resolved := resolveAgentEnv(gitSafeEnv("/work/dir"))
 	if resolved[GateRoleEnvVar] != "1" {
 		t.Errorf("%s = %q, want \"1\" (managed stamp must win over ambient)", GateRoleEnvVar, resolved[GateRoleEnvVar])
+	}
+}
+
+func TestCodexProcessEnvAddsOnlyStateRootAndPreservesManagedPrecedence(t *testing.T) {
+	t.Setenv("CODEX_HOME", "/ambient/codex")
+	t.Setenv("GIT_EDITOR", "vim")
+	t.Setenv("GIT_SEQUENCE_EDITOR", "vim")
+	t.Setenv("GIT_TERMINAL_PROMPT", "1")
+	t.Setenv(GateRoleEnvVar, "0")
+	t.Setenv("PWD", "/ambient/work")
+
+	resolved := resolveAgentEnv(codexProcessEnv("/gate/worktree", "/private/codex-run", true))
+	if resolved["CODEX_HOME"] != "/private/codex-run" {
+		t.Fatalf("CODEX_HOME = %q, want selected per-run root", resolved["CODEX_HOME"])
+	}
+	if resolved["GIT_EDITOR"] != "true" || resolved["GIT_SEQUENCE_EDITOR"] != "true" || resolved["GIT_TERMINAL_PROMPT"] != "0" {
+		t.Fatalf("git-safe editor/prompt precedence changed: %#v", resolved)
+	}
+	if resolved[GateRoleEnvVar] != "1" {
+		t.Fatalf("%s = %q, want managed marker", GateRoleEnvVar, resolved[GateRoleEnvVar])
+	}
+	if runtime.GOOS != "windows" && runtime.GOOS != "plan9" && resolved["PWD"] != "/gate/worktree" {
+		t.Fatalf("PWD = %q, want gate worktree", resolved["PWD"])
+	}
+}
+
+func TestNonCodexProcessEnvDropsManagedCodexHomeWithoutChangingGitSafeValues(t *testing.T) {
+	t.Setenv("CODEX_HOME", "/private/codex-run")
+	t.Setenv("GIT_EDITOR", "vim")
+	unmanaged := resolveAgentEnv(nonCodexProcessEnv(context.Background(), "/gate/worktree"))
+	if unmanaged["CODEX_HOME"] != "/private/codex-run" {
+		t.Fatal("unmanaged adapter environment unexpectedly changed")
+	}
+
+	managedCtx := withCodexHomeIsolation(context.Background())
+	managed := resolveAgentEnv(nonCodexProcessEnv(managedCtx, "/gate/worktree"))
+	if _, ok := managed["CODEX_HOME"]; ok {
+		t.Fatal("managed non-Codex subprocess received CODEX_HOME")
+	}
+	if managed["GIT_EDITOR"] != "true" || managed["GIT_SEQUENCE_EDITOR"] != "true" || managed["GIT_TERMINAL_PROMPT"] != "0" || managed[GateRoleEnvVar] != "1" {
+		t.Fatalf("managed non-Codex environment changed git-safe precedence: %#v", managed)
+	}
+}
+
+func TestManagedCodexProcessEnvNeverSubstitutesAmbientStateRoot(t *testing.T) {
+	t.Setenv("CODEX_HOME", "/ambient/must-not-be-recovered")
+	resolved := resolveAgentEnv(codexProcessEnv("/gate/worktree", "", true))
+	if _, ok := resolved["CODEX_HOME"]; ok {
+		t.Fatal("managed Codex process substituted ambient CODEX_HOME for missing per-run custody")
+	}
+}
+
+func TestWithCodexHomeIsolationKeepsSelectedRootOutOfNonCodexAdapterProcess(t *testing.T) {
+	t.Setenv("CODEX_HOME", "/private/codex-run")
+	inner := &environmentCaptureAgent{}
+	wrapped := WithSteering(WithCodexHomeIsolation(inner))
+	if _, err := wrapped.Run(context.Background(), RunOpts{CWD: "/gate/worktree"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := inner.env["CODEX_HOME"]; ok {
+		t.Fatal("selected Codex root reached a wrapped non-Codex adapter process")
+	}
+	if inner.env[GateRoleEnvVar] != "1" || inner.env["GIT_TERMINAL_PROMPT"] != "0" {
+		t.Fatalf("wrapper changed managed environment precedence: %#v", inner.env)
 	}
 }

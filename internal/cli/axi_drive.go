@@ -101,6 +101,7 @@ func newAxiRunCmd() *cobra.Command {
 
 func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, intent string) error {
 	ctx := cmd.Context()
+	codexStateRoot := selectedCodexStateRoot()
 	env, err := openAxiRunEnv()
 	if err != nil {
 		return emitError(cmd, 1, err.Error(), repoInitHelp(err)...)
@@ -142,7 +143,7 @@ func runAxiRun(cmd *cobra.Command, autoYes bool, skipSteps []types.StepName, int
 			return guard(cmd)
 		}
 		var err error
-		runID, err = triggerRun(ctx, env, branch, headSHA, skipSteps, intent)
+		runID, err = triggerRun(ctx, env, branch, headSHA, skipSteps, intent, codexStateRoot)
 		if err != nil {
 			return emitError(cmd, 1, err.Error())
 		}
@@ -219,9 +220,12 @@ func preflightGuard(ctx context.Context, env *axiEnv, branch string) func(*cobra
 // the gate to trigger a pipeline, and falls back to a rerun when the push was a
 // no-op (the gate already had this commit). Callers must check for an existing
 // active run first (see activeRunID) and apply pre-flight guards.
-func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent string) (string, error) {
+func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSteps []types.StepName, intent string, codexStateRoot *string) (string, error) {
 	pushOptions := formatSkipPushOptions(skipSteps)
 	if opt := formatIntentPushOption(intent); opt != "" {
+		pushOptions = append(pushOptions, opt)
+	}
+	if opt := formatCodexStateRootPushOption(codexStateRoot); opt != "" {
 		pushOptions = append(pushOptions, opt)
 	}
 	priorRunIDs, err := runIDsForHead(env.client, env.repo.ID, branch, headSHA)
@@ -230,7 +234,7 @@ func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSt
 		// a matching terminal run may predate this push, so do not attach to it.
 		priorRunIDs = nil
 	}
-	pushErr := git.PushWithOptions(ctx, ".", gate.RemoteName, "refs/heads/"+branch, "", false, pushOptions)
+	pushErr := pushToGateForAxi(ctx, branch, pushOptions, codexStateRoot)
 
 	if run, _ := waitForTriggeredRunForHead(ctx, env.client, env.repo.ID, branch, headSHA, priorRunIDs, triggerWaitTimeout); run != nil {
 		return run.ID, nil
@@ -242,10 +246,46 @@ func triggerRun(ctx context.Context, env *axiEnv, branch, headSHA string, skipSt
 	// No run appeared: the push was likely up-to-date. Rerun the latest gate
 	// head so `axi run` is still useful when there are no new commits.
 	var rr ipc.RerunResult
-	if err := env.client.Call(ipc.MethodRerun, rerunParams(env.repo.ID, branch, skipSteps, intent), &rr); err != nil {
+	if err := env.client.Call(ipc.MethodRerun, rerunParams(env.repo.ID, branch, skipSteps, intent, codexStateRoot), &rr); err != nil {
 		return "", fmt.Errorf("no run started for %q: %v", branch, err)
 	}
 	return rr.RunID, nil
+}
+
+// pushToGateForAxi keeps the transient state-root transport inside the AXI
+// trigger boundary even when git or a receive hook echoes the command or push
+// option in its failure. The original failure's unrelated detail is retained.
+func pushToGateForAxi(ctx context.Context, branch string, pushOptions []string, codexStateRoot *string) error {
+	pushErr := git.PushWithOptions(ctx, ".", gate.RemoteName, "refs/heads/"+branch, "", false, pushOptions)
+	return redactCodexStateRootPushFailure(pushErr, codexStateRoot)
+}
+
+func redactCodexStateRootPushFailure(pushErr error, codexStateRoot *string) error {
+	if pushErr == nil || codexStateRoot == nil {
+		return pushErr
+	}
+
+	const redacted = "[redacted]"
+	option := formatCodexStateRootPushOption(codexStateRoot)
+	payload := strings.TrimPrefix(option, codexStateRootPushOptionPrefix)
+	message := pushErr.Error()
+	for _, transport := range []string{
+		"-o " + option,
+		"-o" + option,
+		"--push-option " + option,
+		"--push-option=" + option,
+	} {
+		message = strings.ReplaceAll(message, transport, redacted)
+	}
+	for _, sensitive := range []string{*codexStateRoot, payload, option, codexStateRootPushOptionPrefix} {
+		if sensitive != "" {
+			message = strings.ReplaceAll(message, sensitive, redacted)
+		}
+	}
+	if message == pushErr.Error() {
+		return pushErr
+	}
+	return fmt.Errorf("%s", message)
 }
 
 // runIDsForHead snapshots the run IDs already present for a repo's exact branch
@@ -326,10 +366,11 @@ func activeRunLookupParams(repoID, branch string) *ipc.GetActiveRunParams {
 	return &ipc.GetActiveRunParams{RepoID: repoID, Branch: branch}
 }
 
-func rerunParams(repoID, branch string, skipSteps []types.StepName, intent string) *ipc.RerunParams {
+func rerunParams(repoID, branch string, skipSteps []types.StepName, intent string, codexStateRoot *string) *ipc.RerunParams {
 	return &ipc.RerunParams{
 		RepoID: repoID, Branch: branch, SkipSteps: skipSteps, Intent: intent,
 		GitHubConfigDir: selectedGitHubConfigDir(),
+		CodexStateRoot:  codexStateRoot,
 	}
 }
 

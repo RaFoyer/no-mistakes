@@ -5,12 +5,51 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestNewWithOptionsCodexStateRootDoesNotAffectNonCodexAdapters(t *testing.T) {
+	for _, name := range []types.AgentName{
+		types.AgentClaude, types.AgentRovoDev, types.AgentOpenCode,
+		types.AgentPi, types.AgentCopilot, types.AgentName("acp:target"),
+	} {
+		t.Run(string(name), func(t *testing.T) {
+			without, err := NewWithOptions(name, string(name), nil, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			with, err := NewWithOptions(name, string(name), nil, Options{CodexStateRoot: "/private/codex-run"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(with, without) {
+				t.Fatalf("non-Codex adapter changed when a Codex-only state root was supplied: with=%#v without=%#v", with, without)
+			}
+		})
+	}
+}
+
+func TestNewWithOptionsBindsCodexStateRootOnlyToCodex(t *testing.T) {
+	ag, err := NewWithOptions(types.AgentCodex, "codex", nil, Options{
+		CodexStateRoot:   "/private/codex-run",
+		IsolateCodexHome: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex, ok := ag.(*codexAgent)
+	if !ok {
+		t.Fatalf("adapter = %T, want native Codex", ag)
+	}
+	if codex.stateRoot != "/private/codex-run" || !codex.isolateCodexHome {
+		t.Fatalf("Codex custody = %#v, want isolated per-run root", codex)
+	}
+}
 
 func TestNew_KnownAgents(t *testing.T) {
 	tests := []struct {

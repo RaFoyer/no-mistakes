@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kunchenguid/no-mistakes/internal/types"
@@ -90,6 +91,19 @@ func TestSelectedGitHubConfigDirDistinguishesUnsetFromEmpty(t *testing.T) {
 	}
 }
 
+func TestSelectedCodexStateRootDistinguishesUnsetFromEmpty(t *testing.T) {
+	t.Setenv("CODEX_HOME", "")
+	if got := selectedCodexStateRoot(); got == nil || *got != "" {
+		t.Fatalf("explicit empty selection = %#v, want pointer to empty string", got)
+	}
+	if err := os.Unsetenv("CODEX_HOME"); err != nil {
+		t.Fatal(err)
+	}
+	if got := selectedCodexStateRoot(); got != nil {
+		t.Fatalf("unset selection = %#v, want nil", got)
+	}
+}
+
 func TestFormatSkipPushOptions(t *testing.T) {
 	got := formatSkipPushOptions([]types.StepName{types.StepTest, types.StepLint})
 	want := []string{"no-mistakes.skip=test,lint"}
@@ -128,5 +142,52 @@ func TestParseIntentPushOptionsNone(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("parseIntentPushOptions(no intent) = %q, want empty", got)
+	}
+}
+
+func TestCodexStateRootPushOptionRoundTripIsValueOpaque(t *testing.T) {
+	root := "/private/selected/codex-state"
+	opt := formatCodexStateRootPushOption(&root)
+	if opt == "" {
+		t.Fatal("formatCodexStateRootPushOption returned empty for an explicit selection")
+	}
+	if strings.Contains(opt, root) {
+		t.Fatal("push option exposed the selected state-root value")
+	}
+	got, err := parseCodexStateRootPushOptions([]string{"no-mistakes.skip=test", opt})
+	if err != nil {
+		t.Fatalf("parseCodexStateRootPushOptions() error = %v", err)
+	}
+	if got == nil || *got != root {
+		t.Fatalf("round-trip selection = %#v, want %q", got, root)
+	}
+}
+
+func TestCodexStateRootPushOptionPreservesExplicitEmptyAndAbsent(t *testing.T) {
+	empty := ""
+	opt := formatCodexStateRootPushOption(&empty)
+	got, err := parseCodexStateRootPushOptions([]string{opt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil || *got != "" {
+		t.Fatalf("explicit empty selection = %#v, want pointer to empty string", got)
+	}
+	got, err = parseCodexStateRootPushOptions([]string{"no-mistakes.skip=test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("absent selection = %#v, want nil", got)
+	}
+}
+
+func TestParseCodexStateRootPushOptionFailsValueSafely(t *testing.T) {
+	got, err := parseCodexStateRootPushOptions([]string{codexStateRootPushOptionPrefix + "%%%"})
+	if err == nil || got != nil {
+		t.Fatalf("malformed selection = %#v, %v; want nil error", got, err)
+	}
+	if err.Error() != codexStateRootUnavailable {
+		t.Fatalf("malformed selection error = %q, want constant value-safe error", err)
 	}
 }

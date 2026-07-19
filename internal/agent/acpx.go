@@ -40,7 +40,7 @@ func (a *acpxAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) 
 		prompt = buildACPStructuredPrompt(prompt, opts.JSONSchema)
 	}
 	cmd.Stdin = strings.NewReader(prompt)
-	cmd.Env = gitSafeEnv(opts.CWD)
+	cmd.Env = nonCodexProcessEnv(ctx, opts.CWD)
 	shellenv.ConfigureShellCommand(cmd)
 
 	started, err := startNativeAgentCommand(cmd)

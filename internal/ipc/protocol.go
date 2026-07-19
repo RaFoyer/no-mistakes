@@ -74,6 +74,10 @@ type PushReceivedParams struct {
 	// directory reference. It is transported only to the in-memory run and is
 	// never returned by a read API or persisted with the run.
 	GitHubConfigDir *string `json:"github_config_dir,omitempty"`
+	// CodexStateRoot is an explicitly selected per-run CODEX_HOME reference.
+	// It is transient IPC custody only and is never returned by a read API or
+	// persisted with the run.
+	CodexStateRoot *string `json:"codex_state_root,omitempty"`
 }
 
 // GetRunParams requests a single run by ID.
@@ -111,6 +115,7 @@ type RerunParams struct {
 	SkipSteps       []types.StepName `json:"skip_steps,omitempty"`
 	Intent          string           `json:"intent,omitempty"`
 	GitHubConfigDir *string          `json:"github_config_dir,omitempty"`
+	CodexStateRoot  *string          `json:"codex_state_root,omitempty"`
 }
 
 // SubscribeParams starts an event stream for a run.

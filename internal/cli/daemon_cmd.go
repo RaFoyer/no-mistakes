@@ -2,6 +2,7 @@ package cli
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -60,6 +61,10 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			codexStateRoot, err := parseCodexStateRootPushOptions(pushOptions)
+			if err != nil {
+				return err
+			}
 			gatePath, err := normalizeNotifyGatePath(gate)
 			if err != nil {
 				return err
@@ -85,6 +90,7 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 				SkipSteps:       skipSteps,
 				Intent:          intent,
 				GitHubConfigDir: selectedGitHubConfigDir(),
+				CodexStateRoot:  codexStateRoot,
 			}, &result)
 		},
 	}
@@ -107,6 +113,17 @@ func newDaemonNotifyPushCmd() *cobra.Command {
 // canonicalization and fail-closed validation at the IPC trust boundary.
 func selectedGitHubConfigDir() *string {
 	value, selected := os.LookupEnv("GH_CONFIG_DIR")
+	if !selected {
+		return nil
+	}
+	return &value
+}
+
+// selectedCodexStateRoot captures the AXI caller's explicit CODEX_HOME
+// selection while preserving unset versus explicitly empty. The daemon owns
+// validation at the IPC trust boundary.
+func selectedCodexStateRoot() *string {
+	value, selected := os.LookupEnv("CODEX_HOME")
 	if !selected {
 		return nil
 	}
@@ -185,6 +202,42 @@ func parseIntentPushOptions(options []string) (string, error) {
 		intent = string(decoded)
 	}
 	return intent, nil
+}
+
+const (
+	codexStateRootPushOptionPrefix = "no-mistakes.codex-state-root="
+	codexStateRootUnavailable      = daemon.CodexStateRootUnavailable
+)
+
+// formatCodexStateRootPushOption carries an explicit per-run selection through
+// the local gate without placing the filesystem value in ordinary git output.
+// Nil means unselected; a pointer to an empty string remains an invalid explicit
+// selection for the daemon to reject before run creation.
+func formatCodexStateRootPushOption(selected *string) string {
+	if selected == nil {
+		return ""
+	}
+	return codexStateRootPushOptionPrefix + base64.StdEncoding.EncodeToString([]byte(*selected))
+}
+
+// parseCodexStateRootPushOptions extracts the last explicit state-root
+// selection. Decode failures use the same value-safe admission error as every
+// metadata validation failure.
+func parseCodexStateRootPushOptions(options []string) (*string, error) {
+	var selected *string
+	for _, option := range options {
+		encoded, ok := strings.CutPrefix(option, codexStateRootPushOptionPrefix)
+		if !ok {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, errors.New(codexStateRootUnavailable)
+		}
+		value := string(decoded)
+		selected = &value
+	}
+	return selected, nil
 }
 
 func formatSkipPushOptions(steps []types.StepName) []string {

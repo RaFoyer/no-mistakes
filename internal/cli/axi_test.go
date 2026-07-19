@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -385,6 +386,89 @@ func TestTriggerRunDoesNotRerunAfterFailedPush(t *testing.T) {
 	}
 }
 
+func TestAxiGatePushFailureRedactsCodexStateRootTransport(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("local receive-hook fixture requires a POSIX shell")
+	}
+
+	repoDir := t.TempDir()
+	gateDir := filepath.Join(t.TempDir(), "gate.git")
+	run(t, "", "git", "init", "--bare", gateDir)
+	run(t, gateDir, "git", "config", "receive.advertisePushOptions", "true")
+
+	hook := `#!/bin/sh
+opt=${GIT_PUSH_OPTION_0:-}
+case "$opt" in
+  no-mistakes.codex-state-root=*) ;;
+  *) printf '%s\n' 'hook did not receive state-root option' >&2; exit 2 ;;
+esac
+payload=${opt#no-mistakes.codex-state-root=}
+printf 'returned-error unrelated-detail-755 raw=%s encoded=%s prefix=%s\n' "$CODEX_HOME" "$payload" 'no-mistakes.codex-state-root=' >&2
+printf 'command-summary git push -o %s -o%s --push-option %s --push-option=%s\n' "$opt" "$opt" "$opt" "$opt" >&2
+printf 'hook-failure-evidence raw=%s encoded=%s option=%s\n' "$CODEX_HOME" "$payload" "$opt" >&2
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(gateDir, "hooks", "pre-receive"), []byte(hook), 0o755); err != nil {
+		t.Fatalf("write rejecting receive hook: %v", err)
+	}
+
+	run(t, repoDir, "git", "init")
+	run(t, repoDir, "git", "config", "user.email", "privacy-test@example.invalid")
+	run(t, repoDir, "git", "config", "user.name", "Privacy Test")
+	run(t, repoDir, "git", "checkout", "-b", "privacy-test")
+	run(t, repoDir, "git", "commit", "--allow-empty", "-m", "privacy test")
+	run(t, repoDir, "git", "remote", "add", "no-mistakes", gateDir)
+	t.Chdir(repoDir)
+
+	stateRoot := filepath.Join(t.TempDir(), "codex-state-root-raw-canary")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatalf("create state root: %v", err)
+	}
+	t.Setenv("CODEX_HOME", stateRoot)
+	option := formatCodexStateRootPushOption(&stateRoot)
+	payload := strings.TrimPrefix(option, codexStateRootPushOptionPrefix)
+
+	err := pushToGateForAxi(context.Background(), "privacy-test", []string{option}, &stateRoot)
+	if err == nil {
+		t.Fatal("expected rejecting receive hook to fail the AXI gate push")
+	}
+	got := err.Error()
+	for _, marker := range []string{"returned-error", "command-summary", "hook-failure-evidence", "unrelated-detail-755"} {
+		if !strings.Contains(got, marker) {
+			t.Fatalf("sanitized push failure lost unrelated evidence %q:\n%s", marker, got)
+		}
+	}
+	for label, secret := range map[string]string{
+		"raw state root":  stateRoot,
+		"encoded payload": payload,
+		"option prefix":   codexStateRootPushOptionPrefix,
+	} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("sanitized push failure contains %s", label)
+		}
+	}
+	for label, transport := range map[string]string{
+		"short separated transport": "-o " + option,
+		"short joined transport":    "-o" + option,
+		"long separated transport":  "--push-option " + option,
+		"long equals transport":     "--push-option=" + option,
+	} {
+		if strings.Contains(got, transport) {
+			t.Fatalf("sanitized push failure contains %s", label)
+		}
+	}
+	for _, flaggedMarker := range []string{
+		"-o [redacted]",
+		"-o[redacted]",
+		"--push-option [redacted]",
+		"--push-option=[redacted]",
+	} {
+		if strings.Contains(got, flaggedMarker) {
+			t.Fatalf("state-root transport retained a push-option flag: %q", flaggedMarker)
+		}
+	}
+}
+
 func TestActiveRunLookupParamsIncludeBranch(t *testing.T) {
 	params := activeRunLookupParams("repo-1", "feature/x")
 	if params.RepoID != "repo-1" {
@@ -441,7 +525,8 @@ func TestConfigErrorForFreshAxiRunAllowsReattach(t *testing.T) {
 
 func TestRerunParamsIncludeSkipSteps(t *testing.T) {
 	t.Setenv("GH_CONFIG_DIR", "/profiles/acos")
-	params := rerunParams("repo-1", "feature/x", []types.StepName{types.StepReview}, "user goal")
+	codexStateRoot := "/private/codex-run"
+	params := rerunParams("repo-1", "feature/x", []types.StepName{types.StepReview}, "user goal", &codexStateRoot)
 	if params.RepoID != "repo-1" || params.Branch != "feature/x" || params.Intent != "user goal" {
 		t.Fatalf("unexpected rerun params: %#v", params)
 	}
@@ -450,6 +535,9 @@ func TestRerunParamsIncludeSkipSteps(t *testing.T) {
 	}
 	if params.GitHubConfigDir == nil || *params.GitHubConfigDir != "/profiles/acos" {
 		t.Fatalf("GitHubConfigDir = %#v, want selected profile", params.GitHubConfigDir)
+	}
+	if params.CodexStateRoot == nil || *params.CodexStateRoot != codexStateRoot {
+		t.Fatalf("CodexStateRoot = %#v, want per-entry selection", params.CodexStateRoot)
 	}
 }
 

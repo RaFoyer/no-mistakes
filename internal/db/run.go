@@ -39,15 +39,19 @@ type Run struct {
 	// records only that an explicitly selected per-run profile is required;
 	// the profile path itself remains process-local and is never persisted.
 	RequiresGitHubPublicationProfile bool
-	Intent                           *string
-	IntentSource                     *string
-	IntentSessionID                  *string
-	IntentScore                      *float64
-	CreatedAt                        int64
-	UpdatedAt                        int64
+	// RequiresCodexStateRoot is private durable recovery state. It records only
+	// that a selected per-run root is required; the root itself remains in
+	// process memory and is never persisted.
+	RequiresCodexStateRoot bool
+	Intent                 *string
+	IntentSource           *string
+	IntentSessionID        *string
+	IntentScore            *float64
+	CreatedAt              int64
+	UpdatedAt              int64
 }
 
-const runColumns = `id, repo_id, branch, head_sha, base_sha, status, provisioning_phase, provisioning_progress, provisioning_error, provisioning_started_at, provisioning_completed_at, pr_url, error, blocked_reason, awaiting_agent_since, COALESCE(parked_ms, 0), COALESCE(requires_github_publication_profile, 0), intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
+const runColumns = `id, repo_id, branch, head_sha, base_sha, status, provisioning_phase, provisioning_progress, provisioning_error, provisioning_started_at, provisioning_completed_at, pr_url, error, blocked_reason, awaiting_agent_since, COALESCE(parked_ms, 0), COALESCE(requires_github_publication_profile, 0), COALESCE(requires_codex_state_root, 0), intent, intent_source, intent_session_id, intent_score, created_at, updated_at`
 
 func scanRun(row interface {
 	Scan(...any) error
@@ -55,7 +59,7 @@ func scanRun(row interface {
 	return row.Scan(
 		&r.ID, &r.RepoID, &r.Branch, &r.HeadSHA, &r.BaseSHA, &r.Status,
 		&r.ProvisioningPhase, &r.ProvisioningProgress, &r.ProvisioningError, &r.ProvisioningStartedAt, &r.ProvisioningCompletedAt,
-		&r.PRURL, &r.Error, &r.BlockedReason, &r.AwaitingAgentSince, &r.ParkedMS, &r.RequiresGitHubPublicationProfile,
+		&r.PRURL, &r.Error, &r.BlockedReason, &r.AwaitingAgentSince, &r.ParkedMS, &r.RequiresGitHubPublicationProfile, &r.RequiresCodexStateRoot,
 		&r.Intent, &r.IntentSource, &r.IntentSessionID, &r.IntentScore,
 		&r.CreatedAt, &r.UpdatedAt,
 	)
@@ -65,6 +69,7 @@ func scanRun(row interface {
 // durable atomically with the run row.
 type InsertRunOptions struct {
 	RequiresGitHubPublicationProfile bool
+	RequiresCodexStateRoot           bool
 }
 
 // InsertRun creates a new run record.
@@ -86,11 +91,12 @@ func (d *DB) InsertRunWithOptions(repoID, branch, headSHA, baseSHA string, opts 
 		UpdatedAt:                        ts,
 		ProvisioningPhase:                "created",
 		RequiresGitHubPublicationProfile: opts.RequiresGitHubPublicationProfile,
+		RequiresCodexStateRoot:           opts.RequiresCodexStateRoot,
 	}
 	err := d.withLifecycleTx(func(tx *sql.Tx) error {
 		if _, err := tx.Exec(
-			`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, requires_github_publication_profile, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, r.Status, r.RequiresGitHubPublicationProfile, r.CreatedAt, r.UpdatedAt,
+			`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, requires_github_publication_profile, requires_codex_state_root, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			r.ID, r.RepoID, r.Branch, r.HeadSHA, r.BaseSHA, r.Status, r.RequiresGitHubPublicationProfile, r.RequiresCodexStateRoot, r.CreatedAt, r.UpdatedAt,
 		); err != nil {
 			return fmt.Errorf("insert run: %w", err)
 		}
