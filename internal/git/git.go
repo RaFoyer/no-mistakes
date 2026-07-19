@@ -1,6 +1,7 @@
 package git
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -12,12 +13,20 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/safeurl"
+	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/winproc"
 )
 
 // EmptyTreeSHA is the well-known SHA of an empty tree in git.
 // Used as a base when there is no prior commit to diff against.
 const EmptyTreeSHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+const (
+	copyLocalUserIdentityTimeout   = 30 * time.Second
+	copyLocalUserIdentityWaitDelay = 250 * time.Millisecond
+)
+
+var errCopyLocalUserIdentityTimeout = errors.New("copy local git identity timeout")
 
 // IsZeroSHA returns true if the SHA is the null/zero ref that git uses for
 // new or deleted branches (40 zeros).
@@ -453,29 +462,99 @@ func CommitAll(ctx context.Context, dir, message string) error {
 // <bare>/worktrees/<id>/config.worktree, so concurrent startups never contend.
 // Older Git without `--worktree` support falls back to `--local`.
 func CopyLocalUserIdentity(ctx context.Context, srcDir, dstDir string) error {
+	return copyLocalUserIdentity(ctx, srcDir, dstDir, copyLocalUserIdentityTimeout)
+}
+
+func copyLocalUserIdentity(ctx context.Context, srcDir, dstDir string, timeout time.Duration) error {
+	srcDir, err := validateWorkingDirectory("source", srcDir)
+	if err != nil {
+		return err
+	}
+	dstDir, err = validateWorkingDirectory("destination", dstDir)
+	if err != nil {
+		return err
+	}
+
+	lookupCtx, cancel := context.WithTimeoutCause(ctx, timeout, errCopyLocalUserIdentityTimeout)
+	defer cancel()
 	for _, key := range []string{"user.name", "user.email"} {
-		value, err := Run(ctx, srcDir, "config", "--local", "--get", "--default", "", key)
+		value, err := runLocalIdentityGit(lookupCtx, srcDir, "config", "--local", "--get", "--default", "", key)
 		if err != nil {
-			return err
+			return localIdentityError(lookupCtx, timeout, err)
 		}
 		if value == "" {
 			continue
 		}
-		if _, err := Run(ctx, dstDir, "config", "--worktree", key, value); err != nil {
+		if _, err := runLocalIdentityGit(lookupCtx, dstDir, "config", "--worktree", key, value); err != nil {
 			if !isWorktreeConfigWriteUnavailable(err) {
-				return err
+				return localIdentityError(lookupCtx, timeout, err)
 			}
 			// Per-worktree config is not usable here (Git too old for the
 			// flag, or the repo has multiple worktrees without
 			// extensions.worktreeConfig enabled). Fall back to the shared
 			// local config. Such gates also lack per-worktree isolation, so
 			// this matches the legacy behavior.
-			if _, err := Run(ctx, dstDir, "config", "--local", key, value); err != nil {
-				return err
+			if _, err := runLocalIdentityGit(lookupCtx, dstDir, "config", "--local", key, value); err != nil {
+				return localIdentityError(lookupCtx, timeout, err)
 			}
 		}
 	}
 	return nil
+}
+
+func validateWorkingDirectory(label, dir string) (string, error) {
+	if strings.TrimSpace(dir) == "" {
+		return "", fmt.Errorf("%s working directory is empty", label)
+	}
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("%s working directory must be absolute", label)
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s working directory: %w", label, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("%s working directory %q is unavailable: %w", label, abs, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s working directory %q is not a directory", label, abs)
+	}
+	return abs, nil
+}
+
+// runLocalIdentityGit uses the process-tree-safe one-shot runner for the
+// bounded identity-copy phase. Git is commonly reached through a shim or shell
+// wrapper; cancelling only that wrapper can leave a descendant holding output
+// pipes and defeat the local timeout. Keep this narrow rather than changing
+// the lifecycle semantics of every existing Run call.
+func runLocalIdentityGit(ctx context.Context, dir string, args ...string) (string, error) {
+	if isBareGitDir(dir) {
+		args = append([]string{"--git-dir=" + dir}, args...)
+	}
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	cmd.Env = NonInteractiveEnv(dir)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	shellenv.ConfigureShellCommand(cmd)
+	cmd.WaitDelay = copyLocalUserIdentityWaitDelay
+	out, err := shellenv.OutputShellCommand(cmd)
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w: %s", safeurl.RedactText(strings.Join(args, " ")), err, safeurl.RedactText(strings.TrimSpace(stderr.String())))
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func localIdentityError(ctx context.Context, timeout time.Duration, err error) error {
+	cause := context.Cause(ctx)
+	if errors.Is(cause, errCopyLocalUserIdentityTimeout) {
+		return fmt.Errorf("copy local git identity timed out (local limit %s): %w", timeout, ctx.Err())
+	}
+	if cause != nil {
+		return cause
+	}
+	return err
 }
 
 // isWorktreeConfigWriteUnavailable reports whether a `git config --worktree`

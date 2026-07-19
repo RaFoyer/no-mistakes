@@ -15,6 +15,13 @@ type Paths struct {
 // New returns Paths rooted at NM_HOME or ~/.no-mistakes.
 func New() (*Paths, error) {
 	if env := os.Getenv("NM_HOME"); env != "" {
+		if !filepath.IsAbs(env) {
+			abs, err := filepath.Abs(env)
+			if err != nil {
+				return nil, err
+			}
+			env = abs
+		}
 		return &Paths{root: env}, nil
 	}
 	home, err := os.UserHomeDir()

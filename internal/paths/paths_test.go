@@ -79,6 +79,24 @@ func TestNewWithEnvOverride(t *testing.T) {
 	}
 }
 
+func TestNewCanonicalizesRelativeEnvOverride(t *testing.T) {
+	base := t.TempDir()
+	t.Chdir(base)
+	t.Setenv("NM_HOME", filepath.Join("state", "no-mistakes"))
+
+	p, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(base, "state", "no-mistakes")
+	if p.Root() != want {
+		t.Errorf("Root() = %q, want absolute %q", p.Root(), want)
+	}
+	if !filepath.IsAbs(p.Root()) {
+		t.Errorf("Root() = %q, want absolute path", p.Root())
+	}
+}
+
 func TestNewDefault(t *testing.T) {
 	t.Setenv("NM_HOME", "")
 

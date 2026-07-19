@@ -23,6 +23,11 @@ const (
 	launchdServiceLabelBase = "com.kunchenguid.no-mistakes.daemon"
 	systemdServiceNameBase  = "no-mistakes-daemon"
 	windowsTaskNameBase     = "no-mistakes-daemon"
+	// The daemon receives its state root explicitly through --root. Binding its
+	// process cwd to that same removable directory lets a deleted test NM_HOME
+	// poison every later child process with getcwd failures. The filesystem root
+	// is stable on both managed-service platforms and carries no state authority.
+	stableServiceWorkingDir = "/"
 )
 
 // Legacy (pre-scoping) identifiers, retained only so that a new binary can

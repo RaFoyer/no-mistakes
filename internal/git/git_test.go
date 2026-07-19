@@ -2,11 +2,15 @@ package git
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMain(m *testing.M) {
@@ -155,6 +159,161 @@ func TestCopyLocalUserIdentity(t *testing.T) {
 	}
 	if got := run(t, dst, "git", "config", "--local", "--get", "user.email"); got != "test@test.com" {
 		t.Fatalf("user.email = %q, want %q", got, "test@test.com")
+	}
+}
+
+func TestCopyLocalUserIdentityRejectsMissingSourceDirectory(t *testing.T) {
+	dst := initTestRepo(t)
+	missing := filepath.Join(t.TempDir(), "removed-source")
+
+	err := CopyLocalUserIdentity(context.Background(), missing, dst)
+	if err == nil {
+		t.Fatal("expected a removed source working directory to fail")
+	}
+	if !strings.Contains(err.Error(), "source working directory") {
+		t.Fatalf("error = %q, want actionable source working directory evidence", err)
+	}
+}
+
+func TestCopyLocalUserIdentityRejectsRelativeWorkingDirectories(t *testing.T) {
+	absolute := t.TempDir()
+	for _, tc := range []struct {
+		name    string
+		srcDir  string
+		dstDir  string
+		wantErr string
+	}{
+		{name: "source", srcDir: "relative-source", dstDir: absolute, wantErr: "source working directory must be absolute"},
+		{name: "destination", srcDir: absolute, dstDir: "relative-destination", wantErr: "destination working directory must be absolute"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := CopyLocalUserIdentity(context.Background(), tc.srcDir, tc.dstDir)
+			if err == nil {
+				t.Fatal("expected relative working directory to fail")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %q, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestCopyLocalUserIdentityRejectsRelativeSourceWithoutReadingDeletedAmbientCWD(t *testing.T) {
+	doomed := filepath.Join(t.TempDir(), "deleted-cwd")
+	if err := os.Mkdir(doomed, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(doomed)
+	if err := os.Remove(doomed); err != nil {
+		t.Fatal(err)
+	}
+
+	err := CopyLocalUserIdentity(context.Background(), "relative-source", t.TempDir())
+	if err == nil {
+		t.Fatal("expected relative source working directory to fail")
+	}
+	if !strings.Contains(err.Error(), "source working directory must be absolute") {
+		t.Fatalf("error = %q, want absolute source evidence", err)
+	}
+	if strings.Contains(strings.ToLower(err.Error()), "getwd") {
+		t.Fatalf("error = %q, validator consulted deleted ambient cwd", err)
+	}
+}
+
+func TestCopyLocalUserIdentityTimesOutHungGitLookup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake git executable uses a POSIX shell")
+	}
+	binDir := t.TempDir()
+	fakeGit := filepath.Join(binDir, "git")
+	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
+	// The fake git execs a test helper that deliberately does not exec its
+	// sleep child. Cancelling only the helper would leak the descendant.
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nexec \"$NM_TEST_BINARY\" -test.run=^TestGitIdentityDescendantHelper$\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("NM_GIT_IDENTITY_HELPER", "1")
+	t.Setenv("NM_TEST_BINARY", os.Args[0])
+	t.Setenv("NM_TEST_DESCENDANT_PID_FILE", pidFile)
+	if resolved, err := exec.LookPath("git"); err != nil || resolved != fakeGit {
+		t.Fatalf("fake git lookup = %q, %v; want %q", resolved, err, fakeGit)
+	}
+
+	src := t.TempDir()
+	dst := t.TempDir()
+	started := time.Now()
+	err := copyLocalUserIdentity(context.Background(), src, dst, 2*time.Second)
+	if err == nil {
+		t.Fatal("expected hung git identity lookup to time out")
+	}
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("identity lookup took %s, want bounded failure", elapsed)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %q, want timeout evidence", err)
+	}
+	var pids []byte
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		pids, err = os.ReadFile(pidFile)
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("read descendant pid: %v", err)
+	}
+	pid := strings.TrimSpace(string(pids))
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && exec.Command("kill", "-0", pid).Run() == nil {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if exec.Command("kill", "-0", pid).Run() == nil {
+		_ = exec.Command("kill", "-9", pid).Run()
+		t.Fatalf("git wrapper descendant %s survived identity-copy timeout", pid)
+	}
+}
+
+func TestCopyLocalUserIdentityPreservesEarlierParentDeadline(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake git executable uses a POSIX shell")
+	}
+	binDir := t.TempDir()
+	fakeGit := filepath.Join(binDir, "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nexec sleep 5\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	parentCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := copyLocalUserIdentity(parentCtx, t.TempDir(), t.TempDir(), 5*time.Second)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want parent deadline exceeded", err)
+	}
+	if strings.Contains(err.Error(), "local limit") {
+		t.Fatalf("error = %q, earlier parent deadline mislabeled as local timeout", err)
+	}
+}
+
+func TestGitIdentityDescendantHelper(t *testing.T) {
+	if os.Getenv("NM_GIT_IDENTITY_HELPER") != "1" {
+		return
+	}
+	child := exec.Command("sleep", "5")
+	child.Stdout = os.Stdout
+	child.Stderr = os.Stderr
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(os.Getenv("NM_TEST_DESCENDANT_PID_FILE"), []byte(fmt.Sprint(child.Process.Pid)), 0o644); err != nil {
+		_ = child.Process.Kill()
+		t.Fatal(err)
+	}
+	if err := child.Wait(); err != nil {
+		t.Fatal(err)
 	}
 }
 

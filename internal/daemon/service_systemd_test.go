@@ -52,7 +52,7 @@ func TestStartInstallsSystemdUnitAndStartsManagedDaemon(t *testing.T) {
 	for _, want := range []string{
 		"Description=no-mistakes background daemon",
 		"ExecStart=/usr/local/bin/no-mistakes daemon run --root " + p.Root(),
-		"WorkingDirectory=" + p.Root(),
+		"WorkingDirectory=" + stableServiceWorkingDir,
 		"Environment=\"HOME=" + home + "\"",
 		"Restart=always",
 		"WantedBy=default.target",

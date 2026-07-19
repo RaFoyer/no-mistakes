@@ -41,6 +41,51 @@ func TestServiceDefinitionMatchesRootRejectsPrefixOnlyMatch(t *testing.T) {
 	}
 }
 
+func TestManagedServiceDefinitionsUseStableWorkingDirectory(t *testing.T) {
+	t.Parallel()
+	root := filepath.Join(t.TempDir(), "ephemeral-nm-home")
+	home := t.TempDir()
+	p := paths.WithRoot(root)
+
+	plist := renderLaunchAgent("/opt/no-mistakes/bin/no-mistakes", p, home)
+	if !strings.Contains(plist, "<key>WorkingDirectory</key>\n  <string>/</string>") {
+		t.Fatalf("launch agent must use stable root working directory, got:\n%s", plist)
+	}
+	if strings.Contains(plist, "<key>WorkingDirectory</key>\n  <string>"+root+"</string>") {
+		t.Fatalf("launch agent must not bind process cwd to removable NM_HOME %q", root)
+	}
+
+	unit := renderSystemdUnit("/usr/local/bin/no-mistakes", p, home)
+	if !strings.Contains(unit, "WorkingDirectory=/\n") {
+		t.Fatalf("systemd service must use stable root working directory, got:\n%s", unit)
+	}
+	if strings.Contains(unit, "WorkingDirectory="+root+"\n") {
+		t.Fatalf("systemd service must not bind process cwd to removable NM_HOME %q", root)
+	}
+}
+
+func TestManagedServiceDefinitionsRenderAbsoluteRootFromRelativeNMHome(t *testing.T) {
+	base := t.TempDir()
+	t.Chdir(base)
+	t.Setenv("NM_HOME", filepath.Join("relative", "nm-home"))
+	p, err := paths.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(p.Root()) {
+		t.Fatalf("paths.New root = %q, want absolute root before service rendering", p.Root())
+	}
+
+	plist := renderLaunchAgent("/opt/no-mistakes/bin/no-mistakes", p, t.TempDir())
+	if !strings.Contains(plist, "<string>"+p.Root()+"</string>") {
+		t.Fatalf("launch agent does not carry canonical --root %q:\n%s", p.Root(), plist)
+	}
+	unit := renderSystemdUnit("/usr/local/bin/no-mistakes", p, t.TempDir())
+	if !strings.Contains(unit, "ExecStart=/usr/local/bin/no-mistakes daemon run --root "+p.Root()+"\n") {
+		t.Fatalf("systemd unit does not carry canonical --root %q:\n%s", p.Root(), unit)
+	}
+}
+
 // TestRenderLaunchAgentIncludesManagedPath locks in that the generated plist
 // ships a sensible PATH in EnvironmentVariables. Without this, launchd runs
 // the daemon with `/usr/bin:/bin:/usr/sbin:/sbin` and the agent binary (at

@@ -25,7 +25,9 @@ func serviceDefinitionMatchesRoot(data []byte, p *paths.Paths) bool {
 		return true
 	}
 	for _, line := range strings.Split(text, "\n") {
-		if strings.TrimSpace(line) == "WorkingDirectory="+systemdEscapeArg(root) {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "WorkingDirectory="+systemdEscapeArg(root) ||
+			(strings.HasPrefix(trimmed, "ExecStart=") && strings.HasSuffix(trimmed, " --root "+systemdEscapeArg(root))) {
 			return true
 		}
 	}

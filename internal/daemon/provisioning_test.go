@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -112,6 +113,45 @@ func TestResumeProvisioningRunsRequeuesAfterRestart(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("missing provisioning_completed event: %+v", events)
+	}
+}
+
+func TestProvisioningFailsClosedAndCleansOnlyOwnedWorktreeWhenSourceRemoved(t *testing.T) {
+	p, d, mgr, repo, headSHA := newProvisioningTestManager(t, "provisioning-removed-source")
+	unrelatedDir := p.WorktreeDir(repo.ID, "parked-unrelated-run")
+	if err := os.MkdirAll(unrelatedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(unrelatedDir, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("preserve"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr.provisionHook = func(_ context.Context, phase string, _ *db.Run, _ string) error {
+		if phase == "after_worktree" {
+			return os.RemoveAll(repo.WorkingPath)
+		}
+		return nil
+	}
+
+	runID, err := mgr.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = waitForRunStatus(t, d, runID, types.RunFailed)
+	waitForManagerIdle(t, mgr, 5*time.Second)
+	run, err := d.GetRun(runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.ProvisioningError == nil || !strings.Contains(*run.ProvisioningError, "source working directory") {
+		t.Fatalf("provisioning error = %v, want actionable removed-source evidence", run.ProvisioningError)
+	}
+	if _, err := os.Stat(p.WorktreeDir(repo.ID, runID)); !os.IsNotExist(err) {
+		t.Fatalf("failed run worktree still exists or stat failed: %v", err)
+	}
+	if got, err := os.ReadFile(sentinel); err != nil || string(got) != "preserve" {
+		t.Fatalf("unrelated parked worktree changed: content=%q err=%v", got, err)
 	}
 }
 

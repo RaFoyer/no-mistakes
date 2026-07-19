@@ -128,7 +128,7 @@ RestartSec=2
 
 [Install]
 WantedBy=default.target
-`, command, systemdEscapeArg(p.Root()), strings.Join(envLines, "\n"))
+`, command, systemdEscapeArg(stableServiceWorkingDir), strings.Join(envLines, "\n"))
 }
 
 // systemdEnvironmentLine renders one `Environment=` directive. systemd runs
