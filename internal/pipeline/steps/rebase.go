@@ -397,6 +397,7 @@ Instructions:
 		CWD:        sctx.WorkDir,
 		JSONSchema: commitSummarySchema,
 		OnChunk:    sctx.LogChunk,
+		Purpose:    "rebase-fix",
 	})
 	if err != nil {
 		_, _ = git.Run(ctx, sctx.WorkDir, "rebase", "--abort")

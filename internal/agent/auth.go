@@ -37,6 +37,7 @@ func authorizationRequiredText(text string) bool {
 	for _, needle := range []string{
 		"authorizationrequired", "authorization required", "auth(authorizationrequired)",
 		"not authenticated", "authentication required", "reauthenticate",
+		"not logged in", "login required", "session expired",
 	} {
 		if strings.Contains(text, needle) {
 			return true

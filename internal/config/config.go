@@ -53,6 +53,7 @@ type GlobalConfig struct {
 	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
 	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
+	CursorConfigDir      string              `yaml:"cursor_config_dir"`
 	CITimeout            time.Duration       `yaml:"-"`
 	StepQuietWarning     time.Duration       `yaml:"-"`
 	DaemonConnectTimeout time.Duration       `yaml:"-"`
@@ -77,6 +78,7 @@ type globalConfigRaw struct {
 	ACPRegistryOverrides map[string]string   `yaml:"acp_registry_overrides"`
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
 	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
+	CursorConfigDir      string              `yaml:"cursor_config_dir"`
 	CITimeout            string              `yaml:"ci_timeout"`
 	DaemonConnectTimeout string              `yaml:"daemon_connect_timeout"`
 	BabysitTimeout       string              `yaml:"babysit_timeout"`
@@ -198,6 +200,7 @@ type Config struct {
 	ACPRegistryOverrides map[string]string
 	AgentPathOverride    map[string]string
 	AgentArgsOverride    map[string][]string
+	CursorConfigDir      string
 	CITimeout            time.Duration
 	StepQuietWarning     time.Duration
 	LogLevel             string
@@ -321,7 +324,7 @@ const defaultConfigYAML = `# no-mistakes global configuration
 
 # Agent to use for code generation. This may also be an ordered fallback list,
 # for example: agent: [codex, claude]
-# Options: auto, claude, codex, rovodev, opencode, pi, copilot, acp:<target>
+# Options: auto, claude, codex, cursor, rovodev, opencode, pi, copilot, acp:<target>
 # "auto" detects the first available native agent on your system
 # Use acp:<target> to run an optional user-installed acpx target, for example acp:gemini
 agent: auto
@@ -332,6 +335,10 @@ agent: auto
 # Optional ACP target command overrides for acp:<target> agents
 # acp_registry_overrides:
 #   local-gemini: node /opt/mock-acp-agent.mjs
+
+# Required for explicit agent: cursor. This must be an absolute, private
+# repository-scoped Cursor profile; ambient Cursor auth is never inherited.
+# cursor_config_dir: /Users/you/.config/agent-connectors/owner%2Frepo/cursor/profile
 
 # Maximum time the CI monitor babysits an open PR with no base-branch movement
 # before giving up. The monitor watches CI and auto-rebases when the base branch
@@ -365,6 +372,7 @@ log_level: info
 # agent_path_override:
 #   claude: /usr/local/bin/claude
 #   codex: /opt/codex
+#   cursor: /Users/you/.local/bin/cursor-agent
 
 # Extra native agent CLI flags (optional, global only)
 # Codex service_tier controls speed/priority; model_reasoning_effort controls reasoning depth.
@@ -413,6 +421,7 @@ intent:
 var defaultBinary = map[types.AgentName]string{
 	types.AgentClaude:   "claude",
 	types.AgentCodex:    "codex",
+	types.AgentCursor:   "cursor-agent",
 	types.AgentRovoDev:  "acli",
 	types.AgentOpenCode: "opencode",
 	types.AgentPi:       "pi",
@@ -594,7 +603,7 @@ func (c *Config) resolveConfiguredAgent(ctx context.Context, name types.AgentNam
 		return resolved, err == nil, "auto", err
 	}
 	if _, ok := defaultBinary[name]; !ok && !isACPAgent(name) {
-		return "", false, string(name), fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, rovodev, opencode, pi, copilot, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
+		return "", false, string(name), fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, cursor, rovodev, opencode, pi, copilot, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
 	}
 	bin := c.AgentPathFor(name)
 	resolvedBin, err := lookPath(bin)
@@ -659,6 +668,7 @@ func (c *Config) AgentArgsFor(name types.AgentName) []string {
 var agentArgsOverrideAgents = map[string]bool{
 	string(types.AgentClaude):   true,
 	string(types.AgentCodex):    true,
+	string(types.AgentCursor):   true,
 	string(types.AgentRovoDev):  true,
 	string(types.AgentOpenCode): true,
 	string(types.AgentPi):       true,
@@ -694,6 +704,17 @@ var reservedAgentArgs = map[string]map[string]bool{
 		"--json":       true,
 		"--color":      true,
 	},
+	string(types.AgentCursor): {
+		"-p": true, "--print": true, "--output-format": true,
+		"-H": true, "--header": true,
+		"--stream-partial-output": true, "--model": true, "--mode": true,
+		"--plan": true, "--force": true, "--yolo": true, "--auto-review": true,
+		"--sandbox": true, "--approve-mcps": true, "--trust": true,
+		"--workspace": true, "--add-dir": true, "--plugin-dir": true,
+		"--worktree": true, "-w": true, "--worktree-base": true,
+		"--skip-worktree-setup": true, "--resume": true, "--continue": true,
+		"--api-key": true,
+	},
 	string(types.AgentRovoDev): {
 		"rovodev":                 true,
 		"serve":                   true,
@@ -723,7 +744,7 @@ var reservedAgentArgs = map[string]map[string]bool{
 func validateAgentArgsOverride(override map[string][]string) error {
 	for name, args := range override {
 		if !agentArgsOverrideAgents[name] {
-			return fmt.Errorf("invalid agent name in agent_args_override: %q (valid: claude, codex, rovodev, opencode, pi, copilot)", name)
+			return fmt.Errorf("invalid agent name in agent_args_override: %q (valid: claude, codex, cursor, rovodev, opencode, pi, copilot)", name)
 		}
 		reserved := reservedAgentArgs[name]
 		for i, arg := range args {
@@ -812,6 +833,12 @@ func LoadGlobal(path string) (*GlobalConfig, error) {
 			return nil, err
 		}
 		cfg.AgentArgsOverride = raw.AgentArgsOverride
+	}
+	if raw.CursorConfigDir != "" {
+		if !filepath.IsAbs(raw.CursorConfigDir) {
+			return nil, fmt.Errorf("cursor_config_dir must be an absolute path")
+		}
+		cfg.CursorConfigDir = filepath.Clean(raw.CursorConfigDir)
 	}
 	timeoutValue := raw.CITimeout
 	if timeoutValue == "" {
@@ -1129,6 +1156,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		ACPRegistryOverrides: global.ACPRegistryOverrides,
 		AgentPathOverride:    global.AgentPathOverride,
 		AgentArgsOverride:    global.AgentArgsOverride,
+		CursorConfigDir:      global.CursorConfigDir,
 		CITimeout:            global.CITimeout,
 		StepQuietWarning:     global.StepQuietWarning,
 		LogLevel:             global.LogLevel,

@@ -10,6 +10,9 @@ Global configuration lives at `~/.no-mistakes/config.yaml`. Set `NM_HOME` to rel
 
 agent: auto
 
+# Required only when agent includes cursor.
+cursor_config_dir: /Users/you/.config/agent-connectors/owner%2Frepo/cursor/profile
+
 acpx_path: acpx
 
 acp_registry_overrides:
@@ -18,6 +21,7 @@ acp_registry_overrides:
 agent_path_override:
   claude: /Users/you/bin/claude
   codex: /opt/homebrew/bin/codex
+  cursor: /Users/you/.local/bin/cursor-agent
   rovodev: /usr/local/bin/acli
   opencode: /usr/local/bin/opencode
   pi: /usr/local/bin/pi
@@ -71,12 +75,13 @@ Default agent for all repos and setup-wizard suggestions. Can be overridden per-
 |         |                                                                                   |
 | ------- | --------------------------------------------------------------------------------- |
 | Type    | `string` or `string[]`                                                            |
-| Values  | `auto`, `claude`, `codex`, `rovodev`, `opencode`, `pi`, `copilot`, `acp:<target>` |
+| Values  | `auto`, `claude`, `codex`, `cursor`, `rovodev`, `opencode`, `pi`, `copilot`, `acp:<target>` |
 | Default | `auto`                                                                            |
 
 `auto` resolves to the first supported native agent found on `PATH` in this order: `claude`, `codex`, `opencode`, `acli` with `rovodev` support, `pi`, then `copilot`.
 `acp:<target>` uses the user-installed `acpx` binary to run an ACP target, for example `acp:gemini`.
 ACP agents are opt-in and are not considered by `agent: auto`.
+Cursor is also explicit-only and is not considered by `agent: auto`.
 The effective agent configuration must resolve to a runnable runner before a new validation gate starts.
 If an explicit agent is unavailable, `auto` finds no native agent, or no fallback-list entry is available, the gate fails before its first pipeline step rather than reporting a partial command-only validation as passed.
 `no-mistakes doctor` checks the global configuration, while every run repeats resolution after applying any trusted repository-level `agent` override.
@@ -91,6 +96,19 @@ The list is filtered to entries available to the daemon at run startup, and the 
 If no entry is available, the gate fails before its first pipeline step.
 If a pipeline invocation fails because that agent process cannot start or exits with an error, no-mistakes retries that invocation with the next available fallback.
 Structured findings and schema/output validation problems do not trigger fallback.
+
+The native `cursor` adapter is pinned to Cursor Agent CLI `2026.07.17-3e2a980` and fails closed on version drift. Routine work uses `cursor-grok-4.5-medium`; only deliberate high-risk review confirmation uses `cursor-grok-4.5-high`. No route uses Cursor Auto or a Fast variant. Reviews run in read-only ask mode. Mutating phases require the daemon-owned linked worktree, Cursor sandboxing, and the adapter-managed `--force`; no Cursor-created worktree is used.
+
+Cursor project-instruction suppression is not verified. A repository with `disable_project_settings: true` therefore refuses any fallback list containing `cursor` rather than loading `.cursor/rules`, `AGENTS.md`, or `CLAUDE.md` under the opt-out.
+
+### cursor_config_dir
+
+Absolute path to the repository-scoped Cursor Agent profile used by an explicit `cursor` entry. The adapter requires a real private `0700` directory, selects file-backed credentials with `AGENT_CLI_CREDENTIAL_STORE=file`, disables browser launch, removes ambient `CURSOR_API_KEY` and Cursor profile variables, and never reads credential contents into no-mistakes.
+
+|         |                                  |
+| ------- | -------------------------------- |
+| Type    | `string`                         |
+| Default | Empty (Cursor launch is refused) |
 
 ### acpx_path
 
@@ -136,6 +154,7 @@ Default native binary names when no override is set:
 | ---------- | ---------- |
 | `claude`   | `claude`   |
 | `codex`    | `codex`    |
+| `cursor`   | `cursor-agent` |
 | `rovodev`  | `acli`     |
 | `opencode` | `opencode` |
 | `pi`       | `pi`       |
@@ -149,7 +168,7 @@ Use this to set model selection, service tier, reasoning effort, permission mode
 |         |                                                           |
 | ------- | --------------------------------------------------------- |
 | Type    | `map[string][]string`                                     |
-| Keys    | `claude`, `codex`, `rovodev`, `opencode`, `pi`, `copilot` |
+| Keys    | `claude`, `codex`, `cursor`, `rovodev`, `opencode`, `pi`, `copilot` |
 | Default | Empty (no extra flags)                                    |
 
 User-supplied flags are inserted ahead of no-mistakes' managed flags, so your choices usually take precedence. A few flags are reserved because no-mistakes depends on them to communicate with the agent - setting any of these returns a config error on load:
@@ -158,6 +177,7 @@ User-supplied flags are inserted ahead of no-mistakes' managed flags, so your ch
 | ---------- | ----------------------------------------------------------------------------------------------------------- |
 | `claude`   | `-p`, `--print`, `--verbose`, `--output-format`, `--json-schema`, `-r`, `--resume`, `--session-id`, `-c`, `--continue`, `--fork-session` |
 | `codex`    | `exec`, `resume`, `--resume`, `--session`, `--session-id`, `--thread`, `--thread-id`, `--last`, `--json`, `--color` |
+| `cursor`   | Prompt/model/output, auth/header, permission/sandbox, MCP/plugin, workspace/worktree, and session flags are adapter-managed and reserved |
 | `rovodev`  | `rovodev`, `serve`, `--disable-session-token`                                                               |
 | `opencode` | `serve`, `--hostname`, `--port`, `--print-logs`                                                             |
 | `pi`       | `--mode`, `--no-session`                                                                                    |

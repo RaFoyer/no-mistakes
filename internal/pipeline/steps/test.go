@@ -192,6 +192,7 @@ Rules:
 			CWD:        sctx.WorkDir,
 			JSONSchema: testFindingsSchema,
 			OnChunk:    sctx.LogChunk,
+			Purpose:    "test-evidence",
 		})
 		if err != nil {
 			return nil, fmt.Errorf("agent run tests: %w", err)

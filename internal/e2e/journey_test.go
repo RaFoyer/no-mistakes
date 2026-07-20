@@ -45,7 +45,7 @@ func TestUserJourney(t *testing.T) {
 	// Subtests run sequentially: each one calls t.Setenv to point env
 	// vars at its own temp dirs, and t.Setenv is incompatible with
 	// t.Parallel. Three serial runs cost ~30s total on a warm cache.
-	for _, agentName := range []string{"claude", "codex", "opencode"} {
+	for _, agentName := range []string{"claude", "codex", "cursor", "opencode"} {
 		agentName := agentName
 		t.Run(agentName, func(t *testing.T) {
 			runHappyPath(t, agentName)

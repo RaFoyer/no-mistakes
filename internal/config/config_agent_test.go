@@ -100,6 +100,26 @@ func TestResolveAgent_ExplicitAgent(t *testing.T) {
 	}
 }
 
+func TestResolveAgent_ExplicitCursorWithoutChangingAutoOrder(t *testing.T) {
+	cfg := &Config{Agent: types.AgentCursor}
+	if err := cfg.ResolveAgent(context.Background(), func(bin string) (string, error) {
+		if bin != "cursor-agent" {
+			t.Fatalf("lookPath(%q), want cursor-agent", bin)
+		}
+		return "/usr/local/bin/cursor-agent", nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Agent != types.AgentCursor {
+		t.Fatalf("agent = %q", cfg.Agent)
+	}
+	for _, candidate := range agentProbeOrder {
+		if candidate == types.AgentCursor {
+			t.Fatal("Cursor must remain excluded from auto detection")
+		}
+	}
+}
+
 func TestResolveAgent_ExplicitAgentMustBeRunnable(t *testing.T) {
 	cfg := &Config{Agent: types.AgentCodex}
 	err := cfg.ResolveAgent(context.Background(), func(bin string) (string, error) {

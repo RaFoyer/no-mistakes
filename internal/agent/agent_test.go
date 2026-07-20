@@ -60,6 +60,7 @@ func TestNew_KnownAgents(t *testing.T) {
 	}{
 		{name: "claude", agent: types.AgentClaude, bin: "claude", wantName: "claude"},
 		{name: "codex", agent: types.AgentCodex, bin: "codex", wantName: "codex"},
+		{name: "cursor", agent: types.AgentCursor, bin: "cursor-agent", wantName: "cursor"},
 		{name: "rovodev", agent: types.AgentRovoDev, bin: "acli", wantName: "rovodev"},
 		{name: "opencode", agent: types.AgentOpenCode, bin: "opencode", wantName: "opencode"},
 		{name: "pi", agent: types.AgentPi, bin: "pi", wantName: "pi"},

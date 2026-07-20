@@ -451,6 +451,7 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, lookPath func(str
 			ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
 			DisableProjectSettings: cfg.DisableProjectSettings,
 			IsolateCodexHome:       name == types.AgentCodex,
+			CursorConfigDir:        cfg.CursorConfigDir,
 		}
 		next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agentOptions)
 		if err != nil {
@@ -461,6 +462,9 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, lookPath func(str
 		}
 		if name != types.AgentCodex {
 			next = agent.WithCodexHomeIsolation(next)
+		}
+		if name == types.AgentCursor {
+			next = agent.WithIsolatedWorktree(next)
 		}
 		created = append(created, agent.WithSteering(next))
 	}
@@ -1213,6 +1217,7 @@ func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, he
 				ACPRegistryOverrides:   cfg.ACPRegistryOverrides,
 				DisableProjectSettings: cfg.DisableProjectSettings,
 				IsolateCodexHome:       name == types.AgentCodex,
+				CursorConfigDir:        cfg.CursorConfigDir,
 			}
 			if name == types.AgentCodex {
 				agentOptions.CodexStateRoot = codexStateRoot
@@ -1225,6 +1230,9 @@ func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, he
 			}
 			if name != types.AgentCodex {
 				next = agent.WithCodexHomeIsolation(next)
+			}
+			if name == types.AgentCursor {
+				next = agent.WithIsolatedWorktree(next)
 			}
 			// Steer every pipeline agent to keep writes inside the worktree and
 			// avoid mutating system state (e.g. brew/Homebrew touching

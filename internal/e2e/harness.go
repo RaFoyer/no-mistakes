@@ -119,7 +119,7 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 	// is a guard rail: BinDir is prepended to PATH, so any stray invocation
 	// of gh by the pipeline (e.g. PR/CI on a misconfigured origin) hits
 	// the fakeagent stub instead of a real, authenticated system gh.
-	for _, name := range []string{"claude", "codex", "opencode", "gh"} {
+	for _, name := range []string{"claude", "codex", "cursor", "opencode", "gh"} {
 		linkPath := filepath.Join(h.BinDir, name)
 		if err := os.Symlink(fakeBin, linkPath); err != nil {
 			t.Fatalf("symlink %s: %v", linkPath, err)
@@ -189,8 +189,19 @@ func (h *Harness) writeGlobalConfig() {
 		h.t.Fatalf("mkdir nm home: %v", err)
 	}
 	binLink := filepath.Join(h.BinDir, h.agentName)
+	cursorConfig := ""
+	if h.agentName == "cursor" {
+		profile := filepath.Join(h.RootDir, "cursor-profile")
+		if err := os.MkdirAll(profile, 0o700); err != nil {
+			h.t.Fatalf("mkdir fake cursor profile: %v", err)
+		}
+		if err := os.Chmod(profile, 0o700); err != nil {
+			h.t.Fatalf("chmod fake cursor profile: %v", err)
+		}
+		cursorConfig = "cursor_config_dir: " + profile + "\n"
+	}
 	cfg := fmt.Sprintf(`agent: %s
-log_level: debug
+%slog_level: debug
 agent_path_override:
   %s: %s
 auto_fix:
@@ -200,7 +211,7 @@ auto_fix:
   review: 0
   document: 0
   ci: 0
-`, h.agentName, h.agentName, binLink)
+`, h.agentName, cursorConfig, h.agentName, binLink)
 	if err := os.WriteFile(configPath, []byte(cfg), 0o644); err != nil {
 		h.t.Fatalf("write config: %v", err)
 	}

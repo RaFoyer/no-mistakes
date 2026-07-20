@@ -15,11 +15,16 @@ const PolicyVersion = "nm-routing-v2"
 const ConfigFingerprintVersion = "nm-config-fingerprint-v2"
 
 const (
-	ModelLuna   = "gpt-5.6-luna"
-	ModelTerra  = "gpt-5.6-terra"
-	ModelSol    = "gpt-5.6-sol"
-	EffortXHigh = "xhigh"
-	EffortHigh  = "high"
+	ModelLuna         = "gpt-5.6-luna"
+	ModelTerra        = "gpt-5.6-terra"
+	ModelSol          = "gpt-5.6-sol"
+	ModelCursorLow    = "cursor-grok-4.5-low"
+	ModelCursorMedium = "cursor-grok-4.5-medium"
+	ModelCursorHigh   = "cursor-grok-4.5-high"
+	EffortLow         = "low"
+	EffortMedium      = "medium"
+	EffortXHigh       = "xhigh"
+	EffortHigh        = "high"
 )
 
 type Risk string
@@ -82,11 +87,18 @@ func Decide(in Input) Decision {
 		Repository:              bounded(CanonicalRepository(in.Repository), 512),
 		Reason:                  "default initial/default work",
 	}
+	if strings.EqualFold(harness, "cursor") {
+		d.RequestedModel = ModelCursorMedium
+		d.EffectiveModel = ModelCursorMedium
+		d.RequestedEffort = EffortMedium
+		d.EffectiveEffort = EffortMedium
+		d.Reason = "verified Cursor Grok routine policy"
+	}
 	// The approved GPT policy is enforceable only by Codex. Other adapters may
 	// still be explicitly configured, but their evidence must never claim that
 	// a GPT model or reasoning effort was effective when the adapter did not
 	// receive those controls.
-	if !strings.EqualFold(harness, "codex") {
+	if !strings.EqualFold(harness, "codex") && !strings.EqualFold(harness, "cursor") {
 		d.EffectiveModel = ""
 		d.EffectiveEffort = ""
 		d.Reason = "configured harness cannot enforce the Codex GPT routing policy"
@@ -96,7 +108,7 @@ func Decide(in Input) Decision {
 	if phase == "review" && !in.ReviewConfirmation {
 		return enforceAdapterEvidence(d)
 	}
-	if (risk == RiskMedium || risk == RiskHigh) && phase != "review" && phase != "review-confirmation" {
+	if strings.EqualFold(harness, "codex") && (risk == RiskMedium || risk == RiskHigh) && phase != "review" && phase != "review-confirmation" {
 		d.EffectiveModel = ModelTerra
 		d.EffectiveEffort = EffortHigh
 		d.Reason = "medium-high risk policy"
@@ -105,9 +117,17 @@ func Decide(in Input) Decision {
 	// so it always remains Luna. Sol is legal only for a later review turn
 	// after the earlier review classified the change as high risk.
 	if phase == "review-confirmation" && in.ReviewConfirmation && risk == RiskHigh {
-		d.EffectiveModel = ModelSol
-		d.EffectiveEffort = EffortHigh
-		d.Reason = "high-risk review confirmation"
+		if strings.EqualFold(harness, "cursor") {
+			d.RequestedModel = ModelCursorHigh
+			d.EffectiveModel = ModelCursorHigh
+			d.RequestedEffort = EffortHigh
+			d.EffectiveEffort = EffortHigh
+			d.Reason = "deliberate high-risk Cursor review confirmation"
+		} else {
+			d.EffectiveModel = ModelSol
+			d.EffectiveEffort = EffortHigh
+			d.Reason = "high-risk review confirmation"
+		}
 	}
 	return enforceAdapterEvidence(d)
 }
@@ -138,7 +158,7 @@ func ForAdapter(decision Decision, harness string) Decision {
 }
 
 func enforceAdapterEvidence(d Decision) Decision {
-	if strings.EqualFold(d.EffectiveHarness, "codex") {
+	if strings.EqualFold(d.EffectiveHarness, "codex") || strings.EqualFold(d.EffectiveHarness, "cursor") {
 		return d
 	}
 	d.EffectiveModel = ""

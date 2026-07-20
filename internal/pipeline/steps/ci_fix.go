@@ -100,6 +100,7 @@ CI logs:
 		Prompt:  prompt,
 		CWD:     sctx.WorkDir,
 		OnChunk: sctx.LogChunk,
+		Purpose: "ci-fix",
 	})
 	if err != nil {
 		return false, fmt.Errorf("agent CI fix: %w", err)

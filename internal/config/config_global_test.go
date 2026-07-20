@@ -65,6 +65,21 @@ func TestLoadGlobalRoutingGenerationChangesWithSource(t *testing.T) {
 	}
 }
 
+func TestLoadGlobalCursorConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("agent: cursor\ncursor_config_dir: /private/cursor-profile\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadGlobal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Agent != types.AgentCursor || cfg.CursorConfigDir != "/private/cursor-profile" {
+		t.Fatalf("cursor config = %+v", cfg)
+	}
+}
+
 func TestEnsureDefaultGlobalConfig_CreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

@@ -75,6 +75,21 @@ func TestDecideDoesNotClaimGPTRouteForNonCodexHarness(t *testing.T) {
 	}
 }
 
+func TestDecideRoutesCursorGrokDeliberately(t *testing.T) {
+	routine := Decide(Input{Harness: "cursor", Purpose: "review", Risk: RiskUnknown})
+	if routine.EffectiveModel != ModelCursorMedium || routine.EffectiveEffort != EffortMedium {
+		t.Fatalf("routine Cursor route = %+v", routine)
+	}
+	high := Decide(ReviewConfirmation(Input{Harness: "cursor", Risk: RiskHigh}))
+	if high.EffectiveModel != ModelCursorHigh || high.EffectiveEffort != EffortHigh {
+		t.Fatalf("confirmed high Cursor route = %+v", high)
+	}
+	fix := Decide(Input{Harness: "cursor", Purpose: "review-fix", Risk: RiskHigh})
+	if fix.EffectiveModel != ModelCursorMedium || fix.EffectiveEffort != EffortMedium {
+		t.Fatalf("non-confirmation Cursor work must remain medium: %+v", fix)
+	}
+}
+
 func TestDecideClearsNonCodexEffectiveControlsAfterEveryRiskBranch(t *testing.T) {
 	for _, tc := range []struct {
 		name string

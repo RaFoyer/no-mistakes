@@ -50,6 +50,7 @@ export default defineConfig({
             { label: "CLI Commands", slug: "reference/cli" },
             { label: "Pipeline Steps", slug: "reference/pipeline-steps" },
             { label: "Global Config", slug: "reference/global-config" },
+            { label: "Cursor Agent Adapter", slug: "reference/cursor-adapter" },
             { label: "Repo Config", slug: "reference/repo-config" },
             { label: "Environment Variables", slug: "reference/environment" },
           ],

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/kunchenguid/no-mistakes/internal/routing"
 )
 
 type fallbackTestAgent struct {
@@ -12,13 +14,42 @@ type fallbackTestAgent struct {
 	run       func() (*Result, error)
 	calls     int
 	resumable bool
+	seen      []RunOpts
 }
 
 func (a *fallbackTestAgent) Name() string { return a.name }
 
-func (a *fallbackTestAgent) Run(context.Context, RunOpts) (*Result, error) {
+func (a *fallbackTestAgent) Run(_ context.Context, opts RunOpts) (*Result, error) {
 	a.calls++
+	a.seen = append(a.seen, opts)
 	return a.run()
+}
+
+func TestFallbackAgentCursorToCodexRebindsModelAndAttribution(t *testing.T) {
+	cursor := &fallbackTestAgent{name: "cursor", run: func() (*Result, error) {
+		return nil, errors.New(`cursor start: executable not found`)
+	}}
+	codex := &fallbackTestAgent{name: "codex", run: func() (*Result, error) {
+		return &Result{Text: "confirmed"}, nil
+	}}
+	base := routing.Decide(routing.ReviewConfirmation(routing.Input{Harness: "cursor", Risk: routing.RiskHigh}))
+	var routes []routing.Decision
+	result, err := NewFallback([]Agent{cursor, codex}).Run(context.Background(), RunOpts{
+		Routing: base,
+		OnRoute: func(route routing.Decision) error { routes = append(routes, route); return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Provider != "codex" {
+		t.Fatalf("provider = %q", result.Provider)
+	}
+	if len(routes) != 2 || routes[0].EffectiveModel != routing.ModelCursorHigh || routes[1].EffectiveModel != routing.ModelSol {
+		t.Fatalf("attempt routes = %+v", routes)
+	}
+	if routes[1].RequestedHarness != "cursor" || routes[1].EffectiveHarness != "codex" {
+		t.Fatalf("fallback attribution = %+v", routes[1])
+	}
 }
 
 func (a *fallbackTestAgent) Close() error { return nil }

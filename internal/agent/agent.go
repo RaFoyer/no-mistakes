@@ -63,6 +63,33 @@ type RunOpts struct {
 	// launch. Fallback wrappers use it once per candidate so route evidence is
 	// immutable and attributable to the actual adapter.
 	OnRoute func(routing.Decision) error
+	// isolatedWorktree is set only by the daemon-owned gate wrapper. It is not
+	// exported, so ordinary callers cannot opt themselves into Cursor --force.
+	isolatedWorktree bool
+}
+
+type isolatedWorktreeAgent struct{ Agent }
+
+func (a isolatedWorktreeAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
+	opts.isolatedWorktree = true
+	return a.Agent.Run(ctx, opts)
+}
+func (a isolatedWorktreeAgent) SupportsSessionResume() bool { return SupportsSessionResume(a.Agent) }
+func (a isolatedWorktreeAgent) SupportsSessionProvider(provider string) bool {
+	return SupportsSessionProvider(a.Agent, provider)
+}
+func (a isolatedWorktreeAgent) ReportsAgentAttempts() bool { return ReportsAgentAttempts(a.Agent) }
+func (a isolatedWorktreeAgent) NeutralizesGateInstructions() bool {
+	return NeutralizesGateInstructions(a.Agent)
+}
+
+// WithIsolatedWorktree marks invocations as running in a daemon-owned gate
+// worktree. Cursor requires this package-local marker before enabling writes.
+func WithIsolatedWorktree(a Agent) Agent {
+	if a == nil {
+		return nil
+	}
+	return isolatedWorktreeAgent{a}
 }
 
 // PromptTransport names the bounded transport used by the native adapter.
@@ -70,7 +97,7 @@ type RunOpts struct {
 func PromptTransport(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	switch {
-	case name == "codex", name == "claude", name == "copilot", name == "pi", strings.HasPrefix(name, "acp:"):
+	case name == "codex", name == "cursor", name == "claude", name == "copilot", name == "pi", strings.HasPrefix(name, "acp:"):
 		return "stdin"
 	case name == "opencode", name == "rovodev":
 		return "http-body"
@@ -290,6 +317,9 @@ type Options struct {
 	// IsolateCodexHome prevents a managed Codex adapter from falling back to
 	// the daemon's ambient CODEX_HOME when no per-run root is available.
 	IsolateCodexHome bool
+	// CursorConfigDir is the explicit repository connector profile. Cursor
+	// refuses to launch without it and never inherits ambient Cursor auth.
+	CursorConfigDir string
 	// DisableProjectSettings, when true, asks a supported adapter (codex,
 	// claude) to launch with the target repo's project-level agent
 	// settings/instructions suppressed. It is the resolved, trusted-only opt-out
@@ -845,6 +875,8 @@ func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts O
 		return &claudeAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings}, nil
 	case types.AgentCodex:
 		return &codexAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, stateRoot: opts.CodexStateRoot, isolateCodexHome: opts.IsolateCodexHome}, nil
+	case types.AgentCursor:
+		return &cursorAgent{bin: bin, extraArgs: extraArgs, configDir: opts.CursorConfigDir}, nil
 	case types.AgentRovoDev:
 		return &rovodevAgent{bin: bin, extraArgs: extraArgs}, nil
 	case types.AgentOpenCode:
@@ -854,7 +886,7 @@ func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts O
 	case types.AgentCopilot:
 		return &copilotAgent{bin: bin, extraArgs: extraArgs}, nil
 	default:
-		return nil, fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, rovodev, opencode, pi, copilot, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
+		return nil, fmt.Errorf("unknown agent %q; valid options: auto, claude, codex, cursor, rovodev, opencode, pi, copilot, acp:<target> (set 'agent' in ~/.no-mistakes/config.yaml)", name)
 	}
 }
 
