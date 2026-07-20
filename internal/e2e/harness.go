@@ -121,8 +121,17 @@ func NewHarness(t *testing.T, opts SetupOpts) *Harness {
 	// the fakeagent stub instead of a real, authenticated system gh.
 	for _, name := range []string{"claude", "codex", "cursor", "opencode", "gh"} {
 		linkPath := filepath.Join(h.BinDir, name)
-		if err := os.Symlink(fakeBin, linkPath); err != nil {
-			t.Fatalf("symlink %s: %v", linkPath, err)
+		var err error
+		if name == "cursor" {
+			// The native Cursor adapter resolves its launcher symlink once so an
+			// auto-updater cannot swap binaries between version check and launch.
+			// Keep argv[0] as "cursor" in this fixture with a non-symlinked link.
+			err = os.Link(fakeBin, linkPath)
+		} else {
+			err = os.Symlink(fakeBin, linkPath)
+		}
+		if err != nil {
+			t.Fatalf("link fake agent %s: %v", linkPath, err)
 		}
 	}
 
