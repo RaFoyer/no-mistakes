@@ -105,6 +105,31 @@ func TestDaemonRestartRefusesWithActiveRuns(t *testing.T) {
 	}
 }
 
+func TestDaemonStartRefusesWithActiveRuns(t *testing.T) {
+	nmHome := t.TempDir()
+	t.Setenv("NM_HOME", nmHome)
+	createLifecycleGuardRuns(t, paths.WithRoot(nmHome))
+
+	startCalled := false
+	prevStart := daemonStartFn
+	daemonStartFn = func(*paths.Paths) error {
+		startCalled = true
+		return nil
+	}
+	t.Cleanup(func() { daemonStartFn = prevStart })
+
+	out, err := executeCmd("daemon", "start")
+	if err == nil {
+		t.Fatal("daemon start should refuse while active runs exist")
+	}
+	if startCalled {
+		t.Fatal("daemon start should not refresh or restart the service after refusing")
+	}
+	if !strings.Contains(out+err.Error(), "refusing daemon start") || !strings.Contains(out+err.Error(), "feature-a") {
+		t.Fatalf("daemon start refusal should list active runs, got output %q error %v", out, err)
+	}
+}
+
 func TestLifecycleCommandsWriteCallerAttributionToCLILog(t *testing.T) {
 	nmHome := t.TempDir()
 	t.Setenv("NM_HOME", nmHome)

@@ -274,16 +274,21 @@ func dedupeSteps(steps []types.StepName) []types.StepName {
 }
 
 func newDaemonStartCmd() *cobra.Command {
-	return &cobra.Command{
+	var force bool
+	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Install or refresh the managed daemon service and start it",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			logLifecycleInvocation("daemon.start", force)
 			return trackCommand("daemon.start", func() error {
 				p, err := paths.New()
 				if err != nil {
 					return err
 				}
 				if err := p.EnsureDirs(); err != nil {
+					return err
+				}
+				if err := guardDestructiveDaemonLifecycle(p, cmd.ErrOrStderr(), "daemon start", force); err != nil {
 					return err
 				}
 				if err := daemonStartFn(p); err != nil {
@@ -294,6 +299,8 @@ func newDaemonStartCmd() *cobra.Command {
 			})
 		},
 	}
+	cmd.Flags().BoolVar(&force, "force", false, "refresh or start the daemon even when pipeline runs are active")
+	return cmd
 }
 
 func newDaemonStopCmd() *cobra.Command {

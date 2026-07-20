@@ -134,7 +134,7 @@ func TestProvisioningFailsClosedAndCleansOnlyOwnedWorktreeWhenSourceRemoved(t *t
 		return nil
 	}
 
-	runID, err := mgr.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil)
+	runID, err := mgr.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

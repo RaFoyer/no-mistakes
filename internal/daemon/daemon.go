@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/agent"
+	"github.com/kunchenguid/no-mistakes/internal/buildinfo"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/git"
@@ -20,6 +21,11 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
 	"github.com/kunchenguid/no-mistakes/internal/types"
+)
+
+const (
+	CurrentHandoffProtocol = 1
+	CurrentHandoffSchema   = 1
 )
 
 var applyShellEnvToProcess = shellenv.ApplyToProcess
@@ -130,6 +136,17 @@ func RunWithOptions(p *paths.Paths, d *db.DB, stepFactory StepFactory) error {
 		return err
 	}
 	defer lock.Release()
+
+	generation := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UTC().UnixNano())
+	build := buildinfo.CurrentVersion() + "-" + buildinfo.Commit
+	if err := d.RegisterDaemonGeneration(db.DaemonGeneration{
+		Generation: generation,
+		Build:      build,
+		Protocol:   CurrentHandoffProtocol,
+		Schema:     CurrentHandoffSchema,
+	}); err != nil {
+		return fmt.Errorf("register daemon generation: %w", err)
+	}
 
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
@@ -415,7 +432,32 @@ func migrateGateConfigs(ctx context.Context, p *paths.Paths) {
 
 func registerHandlers(srv *ipc.Server, mgr *RunManager, d *db.DB, shutdown func()) {
 	srv.Handle(ipc.MethodHealth, func(_ context.Context, _ json.RawMessage) (interface{}, error) {
-		return &ipc.HealthResult{Status: "ok"}, nil
+		result := &ipc.HealthResult{Status: "ok", MaintenancePhase: string(db.HandoffPhaseActive)}
+		generation, err := d.GetDaemonGeneration()
+		if err != nil {
+			return nil, fmt.Errorf("get daemon generation: %w", err)
+		}
+		if generation != nil {
+			result.Generation = generation.Generation
+			result.Build = generation.Build
+			result.HandoffProtocol = generation.Protocol
+			result.SchemaVersion = generation.Schema
+			result.MaintenancePhase = string(generation.MaintenancePhase)
+		}
+		handoff, err := d.CurrentHandoff()
+		if err != nil {
+			return nil, fmt.Errorf("get daemon handoff: %w", err)
+		}
+		if handoff != nil {
+			result.HandoffID = handoff.ID
+			result.MaintenancePhase = string(handoff.Phase)
+			queued, queueErr := d.QueuedDaemonAdmissions(handoff.ID)
+			if queueErr != nil {
+				return nil, fmt.Errorf("get queued admissions: %w", queueErr)
+			}
+			result.QueuedAdmissions = len(queued)
+		}
+		return result, nil
 	})
 
 	srv.Handle(ipc.MethodShutdown, func(_ context.Context, _ json.RawMessage) (interface{}, error) {

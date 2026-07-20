@@ -36,6 +36,20 @@ const (
 
 var errAuthorizationParked = errors.New("agent authorization required; run parked for authentication recovery")
 
+// ErrHandoffParked is a non-failure executor result. It means the current
+// operation returned, its DB completion was durable, and the run stopped before
+// starting the next operation. The daemon must retain the worktree and must not
+// route this through ordinary cancellation/failure cleanup.
+var ErrHandoffParked = errors.New("pipeline parked at a durable daemon handoff boundary")
+
+type HandoffCheckpointRequest struct {
+	Run      *db.Run
+	WorkDir  string
+	NextStep types.StepName
+}
+
+type HandoffCheckpointer func(HandoffCheckpointRequest) (bool, error)
+
 // GitHubPublicationProfileUnavailable is deliberately value-safe: it reports
 // lost selected-profile custody without exposing the selected path.
 const GitHubPublicationProfileUnavailable = "selected GitHub publication profile is unavailable"
@@ -59,6 +73,7 @@ type Executor struct {
 	skips                      map[types.StepName]bool
 	githubPublicationConfigDir string
 	githubPublicationRequired  bool
+	handoffCheckpointer        HandoffCheckpointer
 
 	onEvent EventFunc
 
@@ -79,6 +94,13 @@ type Executor struct {
 	routeConfigurationGeneration string
 	routeRisk                    routing.Risk
 	routeReviewConfirmed         bool
+}
+
+// SetHandoffCheckpointer installs the cooperative safe-point callback. The
+// executor invokes it only after a step has returned and its terminal result is
+// committed, immediately before the next step would start.
+func (e *Executor) SetHandoffCheckpointer(checkpointer HandoffCheckpointer) {
+	e.handoffCheckpointer = checkpointer
 }
 
 // SetGitHubPublicationConfigDir gives this run custody of a canonical,
@@ -239,6 +261,9 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 				return e.failRun(run, repo, fmt.Errorf("skip step %s: %w", step.Name(), err), ctx)
 			}
 			e.emitStepEventWithFindingsDiffAndError(ipc.EventStepCompleted, run, repo, step.Name(), string(types.StepStatusSkipped), "", "", "", nil)
+			if err := e.maybeParkForHandoff(run, workDir, i+1); err != nil {
+				return err
+			}
 			continue
 		}
 		skipRemaining, err := e.executeStep(ctx, step, sr, run, repo, workDir, logDir, stepExecutionState{})
@@ -259,6 +284,9 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 			}
 			break
 		}
+		if err := e.maybeParkForHandoff(run, workDir, i+1); err != nil {
+			return err
+		}
 	}
 
 	// Mark run as completed. A failure here must emit a terminal failure rather
@@ -268,6 +296,22 @@ func (e *Executor) Execute(ctx context.Context, run *db.Run, repo *db.Repo, work
 	}
 	run.Status = types.RunCompleted
 	e.emitRunEvent(ipc.EventRunCompleted, run, repo)
+	return nil
+}
+
+func (e *Executor) maybeParkForHandoff(run *db.Run, workDir string, nextIndex int) error {
+	if e.handoffCheckpointer == nil || nextIndex < 0 || nextIndex >= len(e.steps) {
+		return nil
+	}
+	parked, err := e.handoffCheckpointer(HandoffCheckpointRequest{
+		Run: run, WorkDir: workDir, NextStep: e.steps[nextIndex].Name(),
+	})
+	if err != nil {
+		return fmt.Errorf("record daemon handoff checkpoint: %w", err)
+	}
+	if parked {
+		return ErrHandoffParked
+	}
 	return nil
 }
 
@@ -304,6 +348,92 @@ func ValidateRecoveredRun(database *db.DB, run *db.Run, steps []Step) error {
 		return fmt.Errorf("authorization-parked run has no blocked reason")
 	}
 	_, err := (&Executor{db: database, steps: steps}).recoveredGate(run.ID)
+	return err
+}
+
+// ValidateHandoffCheckpoint proves that every operation before NextStep is
+// durably terminal, every later operation is still pending, and no agent PID
+// remains owned. It deliberately rejects any ambiguous in-step state.
+func ValidateHandoffCheckpoint(database *db.DB, run *db.Run, steps []Step, checkpoint *db.RunHandoffCheckpoint) error {
+	if run == nil || run.Status != types.RunRunning || checkpoint == nil || checkpoint.RunID != run.ID || checkpoint.State != db.CheckpointStateParked {
+		return fmt.Errorf("run is not at a parked handoff checkpoint")
+	}
+	results, err := database.GetStepsByRun(run.ID)
+	if err != nil {
+		return fmt.Errorf("get handoff step records: %w", err)
+	}
+	if len(results) != len(steps) {
+		return fmt.Errorf("handoff run has %d step records for %d steps", len(results), len(steps))
+	}
+	nextIndex := -1
+	for i, step := range steps {
+		if results[i].StepName != step.Name() {
+			return fmt.Errorf("handoff step plan changed at %d", i)
+		}
+		if results[i].AgentPID != nil {
+			return fmt.Errorf("handoff step %s still owns agent pid %d", step.Name(), *results[i].AgentPID)
+		}
+		if string(step.Name()) == checkpoint.NextStep {
+			nextIndex = i
+		}
+	}
+	if nextIndex < 1 {
+		return fmt.Errorf("handoff next step %q is not a valid completed-step boundary", checkpoint.NextStep)
+	}
+	for i, result := range results {
+		if i < nextIndex {
+			if result.Status != types.StepStatusCompleted && result.Status != types.StepStatusSkipped {
+				return fmt.Errorf("handoff step %s is %s before checkpoint", result.StepName, result.Status)
+			}
+			continue
+		}
+		if result.Status != types.StepStatusPending {
+			return fmt.Errorf("handoff step %s is %s at or after checkpoint", result.StepName, result.Status)
+		}
+	}
+	return nil
+}
+
+// ResumeHandoff claims a validated between-step checkpoint and executes only
+// the still-pending suffix. A crash after claiming is intentionally handled by
+// ordinary fail-closed stale-run recovery; the daemon never guesses that a
+// newly started external operation was incomplete.
+func (e *Executor) ResumeHandoff(ctx context.Context, run *db.Run, repo *db.Repo, workDir string, checkpoint *db.RunHandoffCheckpoint) error {
+	if repo == nil {
+		return fmt.Errorf("handoff run has no repository")
+	}
+	if checkpoint == nil || filepath.Clean(checkpoint.Worktree) != filepath.Clean(workDir) {
+		return fmt.Errorf("handoff worktree does not match checkpoint")
+	}
+	if err := ValidateHandoffCheckpoint(e.db, run, e.steps, checkpoint); err != nil {
+		return err
+	}
+	checkpoint.State = db.CheckpointStateClaimed
+	if err := e.db.UpsertRunHandoffCheckpoint(*checkpoint); err != nil {
+		return fmt.Errorf("claim handoff checkpoint: %w", err)
+	}
+	logDir := e.paths.RunLogDir(run.ID)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return e.failRun(run, repo, fmt.Errorf("create log dir: %w", err))
+	}
+	e.initializeRunScopes(run.ID)
+	e.restoreRouteState(run.ID)
+	start := -1
+	for i, step := range e.steps {
+		if string(step.Name()) == checkpoint.NextStep {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return fmt.Errorf("handoff next step %q is unavailable", checkpoint.NextStep)
+	}
+	err := e.executeRecoveredRemainder(ctx, run, repo, workDir, logDir, start)
+	if err == nil {
+		if deleteErr := e.db.DeleteRunHandoffCheckpoint(run.ID); deleteErr != nil {
+			slog.Warn("completed handoff run retained stale checkpoint", "run_id", run.ID, "error", deleteErr)
+		}
+	}
 	return err
 }
 
@@ -620,6 +750,9 @@ func (e *Executor) executeRecoveredRemainder(ctx context.Context, run *db.Run, r
 		}
 		if skipRemaining {
 			return e.skipRecoveredRemainder(run, repo, index+1)
+		}
+		if err := e.maybeParkForHandoff(run, workDir, index+1); err != nil {
+			return err
 		}
 	}
 	if err := e.db.UpdateRunStatus(run.ID, types.RunCompleted); err != nil {

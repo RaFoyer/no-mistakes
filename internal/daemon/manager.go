@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -45,6 +46,7 @@ type RunManager struct {
 	provisionQueue   chan struct{}
 	provisionHook    func(context.Context, string, *db.Run, string) error
 	shuttingDown     atomic.Bool // prevents new runs during shutdown
+	quiescing        atomic.Bool // pauses execution admission for cooperative handoff
 	db               *db.DB
 	paths            *paths.Paths
 	steps            StepFactory
@@ -55,6 +57,10 @@ type RunManager struct {
 	subscribers    map[string][]chan<- ipc.Event // runID → subscriber channels
 	completedRuns  map[string]bool               // runIDs whose goroutines have finished
 	completedOrder []string                      // insertion order for FIFO eviction
+
+	handoffMu         sync.Mutex
+	handoffID         string
+	handoffGeneration string
 }
 
 // NewRunManager creates a RunManager. Pass nil for stepFactory to use default steps.
@@ -78,13 +84,162 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 }
 
 type recoveredRunPlan struct {
-	run     *db.Run
-	repo    *db.Repo
-	workDir string
-	gateDir string
-	cfg     *config.Config
-	agent   agent.Agent
-	steps   []pipeline.Step
+	run        *db.Run
+	repo       *db.Repo
+	workDir    string
+	gateDir    string
+	cfg        *config.Config
+	agent      agent.Agent
+	steps      []pipeline.Step
+	checkpoint *db.RunHandoffCheckpoint
+}
+
+func (m *RunManager) HandoffQuiescing() bool {
+	return m.quiescing.Load()
+}
+
+// BeginHandoffQuiesce pauses new execution admission without cancelling any
+// executor. Active operations may finish, but each executor will park before
+// its next step. Profile-dependent runs are refused because #755 intentionally
+// keeps the selected GitHub profile reference process-local.
+func (m *RunManager) BeginHandoffQuiesce(handoffID, generation string) error {
+	m.admissionMu.Lock()
+	defer m.admissionMu.Unlock()
+	if m.shuttingDown.Load() {
+		return fmt.Errorf("daemon is shutting down")
+	}
+	if m.quiescing.Load() {
+		return fmt.Errorf("daemon handoff is already quiescing")
+	}
+	handoff, err := m.db.GetHandoff(handoffID)
+	if err != nil {
+		return err
+	}
+	if handoff == nil || handoff.Phase != db.HandoffPhasePreparing || handoff.SourceGeneration != generation {
+		return fmt.Errorf("handoff prepare record does not match the active generation")
+	}
+	runs, err := m.db.GetActiveRuns()
+	if err != nil {
+		return fmt.Errorf("inspect active runs before handoff: %w", err)
+	}
+	for _, run := range runs {
+		if run.RequiresGitHubPublicationProfile || run.RequiresCodexStateRoot {
+			return fmt.Errorf("run %s retains process-local publication profile or state-root custody", run.ID)
+		}
+		if run.Status == types.RunPending || run.Status == types.RunProvisioning {
+			return fmt.Errorf("run %s has not completed provisioning", run.ID)
+		}
+	}
+	m.mu.Lock()
+	provisioning := len(m.provisionCancels)
+	m.mu.Unlock()
+	if provisioning > 0 {
+		return fmt.Errorf("%d provisioning runs have not reached a resumable boundary", provisioning)
+	}
+	m.handoffMu.Lock()
+	m.handoffID = handoffID
+	m.handoffGeneration = generation
+	m.quiescing.Store(true)
+	m.handoffMu.Unlock()
+	if err := m.db.TransitionHandoff(handoffID, db.HandoffPhaseQuiescing, "execution admission quiesced"); err != nil {
+		m.handoffMu.Lock()
+		m.handoffID = ""
+		m.handoffGeneration = ""
+		m.quiescing.Store(false)
+		m.handoffMu.Unlock()
+		return err
+	}
+	return m.maybeCompleteHandoffCheckpoints()
+}
+
+func (m *RunManager) checkpointForHandoff(request pipeline.HandoffCheckpointRequest) (bool, error) {
+	if !m.quiescing.Load() {
+		return false, nil
+	}
+	m.handoffMu.Lock()
+	handoffID := m.handoffID
+	generation := m.handoffGeneration
+	m.handoffMu.Unlock()
+	if request.Run == nil {
+		return false, fmt.Errorf("handoff checkpoint has no run")
+	}
+	storedRun, err := m.db.GetRun(request.Run.ID)
+	if err != nil {
+		return false, fmt.Errorf("reload handoff run: %w", err)
+	}
+	if storedRun == nil {
+		return false, fmt.Errorf("handoff run %s is missing", request.Run.ID)
+	}
+	if storedRun.RequiresGitHubPublicationProfile || storedRun.RequiresCodexStateRoot {
+		return false, fmt.Errorf("handoff cannot preserve publication profile or state-root custody")
+	}
+	headSHA, err := git.HeadSHA(context.Background(), request.WorkDir)
+	if err != nil {
+		return false, fmt.Errorf("verify handoff worktree HEAD: %w", err)
+	}
+	checkpoint := db.RunHandoffCheckpoint{
+		RunID: request.Run.ID, HandoffID: handoffID, Generation: generation,
+		NextStep: string(request.NextStep), Worktree: filepath.Clean(request.WorkDir),
+		HeadSHA: headSHA, State: db.CheckpointStateParked,
+	}
+	if err := m.db.UpsertRunHandoffCheckpoint(checkpoint); err != nil {
+		return false, err
+	}
+	if err := pipeline.ValidateHandoffCheckpoint(m.db, storedRun, m.steps(), &checkpoint); err != nil {
+		_ = m.db.DeleteRunHandoffCheckpoint(request.Run.ID)
+		return false, err
+	}
+	if err := m.maybeCompleteHandoffCheckpoints(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (m *RunManager) maybeCompleteHandoffCheckpoints() error {
+	if !m.quiescing.Load() {
+		return nil
+	}
+	m.handoffMu.Lock()
+	defer m.handoffMu.Unlock()
+	handoff, err := m.db.GetHandoff(m.handoffID)
+	if err != nil {
+		return err
+	}
+	if handoff == nil || handoff.Phase == db.HandoffPhaseCheckpointed {
+		return nil
+	}
+	if handoff.Phase != db.HandoffPhaseQuiescing {
+		return fmt.Errorf("handoff %s is %s while quiescing", m.handoffID, handoff.Phase)
+	}
+	runs, err := m.db.GetActiveRuns()
+	if err != nil {
+		return err
+	}
+	for _, run := range runs {
+		if run.RequiresGitHubPublicationProfile || run.RequiresCodexStateRoot || run.Status == types.RunProvisioning || run.Status == types.RunPending {
+			return nil
+		}
+		if run.Status == types.RunAwaitingAuth || run.AwaitingAgentSince != nil {
+			results, stepErr := m.db.GetStepsByRun(run.ID)
+			if stepErr != nil {
+				return stepErr
+			}
+			for _, result := range results {
+				if result.AgentPID != nil {
+					return nil
+				}
+			}
+			continue
+		}
+		checkpoint, checkpointErr := m.db.GetRunHandoffCheckpoint(run.ID)
+		if checkpointErr != nil {
+			return checkpointErr
+		}
+		if checkpoint == nil || checkpoint.State != db.CheckpointStateParked {
+			return nil
+		}
+	}
+	return m.db.TransitionHandoff(m.handoffID, db.HandoffPhaseCheckpointed, "all active runs reached durable safe points")
 }
 
 func (m *RunManager) recoverableParkedRuns(ctx context.Context) []recoveredRunPlan {
@@ -117,11 +272,27 @@ func (m *RunManager) recoverableParkedRuns(ctx context.Context) []recoveredRunPl
 }
 
 func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*recoveredRunPlan, error) {
-	if run == nil || (run.Status == types.RunRunning && run.AwaitingAgentSince == nil) || (run.Status != types.RunRunning && run.Status != types.RunAwaitingAuth) || run.Branch == "" {
+	if run == nil {
 		return nil, fmt.Errorf("run is not a parked running run")
 	}
+	// Validate process-local custody before consulting durable recovery state.
+	// Recovery must fail closed on a lost Codex root even in callers that have
+	// intentionally not constructed the remaining manager dependencies yet.
 	if _, err := codexStateRootForRun(run, nil); err != nil {
 		return nil, err
+	}
+	checkpoint, err := m.db.GetRunHandoffCheckpoint(run.ID)
+	if err != nil {
+		return nil, err
+	}
+	handoffParked := checkpoint != nil && checkpoint.State == db.CheckpointStateParked
+	if handoffParked {
+		if err := m.validateRecoveredHandoffCheckpoint(checkpoint); err != nil {
+			return nil, err
+		}
+	}
+	if (run.Status == types.RunRunning && run.AwaitingAgentSince == nil && !handoffParked) || (run.Status != types.RunRunning && run.Status != types.RunAwaitingAuth) || run.Branch == "" {
+		return nil, fmt.Errorf("run is not a parked running run")
 	}
 	repo, err := m.db.GetRepo(run.RepoID)
 	if err != nil {
@@ -135,7 +306,11 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 		return nil, fmt.Errorf("worktree is missing")
 	}
 	headSHA, err := git.HeadSHA(ctx, workDir)
-	if err != nil || headSHA != run.HeadSHA {
+	expectedHead := run.HeadSHA
+	if handoffParked {
+		expectedHead = checkpoint.HeadSHA
+	}
+	if err != nil || headSHA != expectedHead {
 		return nil, fmt.Errorf("worktree head does not match run head")
 	}
 	gateDir := m.paths.RepoDir(repo.ID)
@@ -148,8 +323,17 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 	}
 
 	execSteps := m.steps()
-	if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
-		return nil, err
+	if handoffParked {
+		if filepath.Clean(checkpoint.Worktree) != filepath.Clean(workDir) {
+			return nil, fmt.Errorf("handoff checkpoint worktree does not match run worktree")
+		}
+		if err := pipeline.ValidateHandoffCheckpoint(m.db, run, execSteps, checkpoint); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := pipeline.ValidateRecoveredRun(m.db, run, execSteps); err != nil {
+			return nil, err
+		}
 	}
 	cfg, err := m.loadRecoveredConfig(ctx, run, repo, workDir)
 	if err != nil {
@@ -166,14 +350,38 @@ func (m *RunManager) prepareRecoveredRun(ctx context.Context, run *db.Run) (*rec
 		}
 	}
 	return &recoveredRunPlan{
-		run:     run,
-		repo:    repo,
-		workDir: workDir,
-		gateDir: gateDir,
-		cfg:     cfg,
-		agent:   ag,
-		steps:   execSteps,
+		run:        run,
+		repo:       repo,
+		workDir:    workDir,
+		gateDir:    gateDir,
+		cfg:        cfg,
+		agent:      ag,
+		steps:      execSteps,
+		checkpoint: checkpoint,
 	}, nil
+}
+
+func (m *RunManager) validateRecoveredHandoffCheckpoint(checkpoint *db.RunHandoffCheckpoint) error {
+	handoff, err := m.db.GetHandoff(checkpoint.HandoffID)
+	if err != nil {
+		return err
+	}
+	if handoff == nil || handoff.SourceGeneration != checkpoint.Generation {
+		return fmt.Errorf("handoff checkpoint does not match durable handoff evidence")
+	}
+	if handoff.Phase != db.HandoffPhaseAdopted {
+		return fmt.Errorf("handoff target is not adopted")
+	}
+	generation, err := m.db.GetDaemonGeneration()
+	if err != nil {
+		return err
+	}
+	if generation == nil || generation.Build != handoff.TargetBuild ||
+		generation.Protocol < handoff.TargetProtocolMin || generation.Protocol > handoff.TargetProtocolMax ||
+		generation.Schema < handoff.TargetSchemaMin || generation.Schema > handoff.TargetSchemaMax {
+		return fmt.Errorf("adopted handoff target is incompatible with the active daemon generation")
+	}
+	return nil
 }
 
 func validateRecoveredSessionProviders(database *db.DB, runID string, ag agent.Agent) error {
@@ -389,6 +597,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	executor.SetRouteContext(plan.repo.UpstreamURL, routing.ConfigFingerprint(
 		string(plan.cfg.Agent), strings.Join(agentNames(plan.cfg.Agents), ","),
 		plan.cfg.RoutingGeneration, plan.cfg.AgentPathFor(plan.cfg.Agent)), plan.cfg.RoutingGeneration)
+	executor.SetHandoffCheckpointer(m.checkpointForHandoff)
 	done := make(chan struct{})
 	m.mu.Lock()
 	m.executors[plan.run.ID] = executor
@@ -400,6 +609,7 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 	m.admissionMu.RUnlock()
 	go func() {
 		startedAt := time.Now()
+		handoffParked := false
 		defer m.wg.Done()
 		defer close(done)
 		defer func() {
@@ -413,8 +623,10 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 			}
 			cancel(nil)
 			_ = plan.agent.Close()
-			m.closeSubscribers(plan.run.ID)
-			if plan.run.BlockedReason == nil && plan.run.Status != types.RunAwaitingAuth {
+			if !handoffParked {
+				m.closeSubscribers(plan.run.ID)
+			}
+			if plan.run.BlockedReason == nil && plan.run.Status != types.RunAwaitingAuth && !handoffParked {
 				if err := git.WorktreeRemove(context.Background(), plan.gateDir, plan.workDir); err != nil {
 					slog.Warn("failed to remove recovered worktree", "path", plan.workDir, "error", err)
 				}
@@ -428,16 +640,27 @@ func (m *RunManager) resumeRecoveredRun(plan recoveredRunPlan) {
 			m.mu.Unlock()
 		}()
 
-		if err := executor.Resume(runCtx, plan.run, plan.repo, plan.workDir); err != nil {
+		var resumeErr error
+		if plan.checkpoint != nil {
+			resumeErr = executor.ResumeHandoff(runCtx, plan.run, plan.repo, plan.workDir, plan.checkpoint)
+		} else {
+			resumeErr = executor.Resume(runCtx, plan.run, plan.repo, plan.workDir)
+		}
+		if errors.Is(resumeErr, pipeline.ErrHandoffParked) {
+			handoffParked = true
+			slog.Info("recovered pipeline parked for daemon handoff", "run_id", plan.run.ID)
+			return
+		}
+		if resumeErr != nil {
 			if plan.run.Status == types.RunRunning {
-				errMsg := err.Error()
+				errMsg := resumeErr.Error()
 				plan.run.Status = types.RunFailed
 				plan.run.Error = &errMsg
 				if dbErr := m.db.UpdateRunErrorStatus(plan.run.ID, errMsg, types.RunFailed); dbErr != nil {
 					slog.Error("failed to mark recovered run failed", "run_id", plan.run.ID, "error", dbErr)
 				}
 			}
-			slog.Error("recovered pipeline failed", "run_id", plan.run.ID, "error", err)
+			slog.Error("recovered pipeline failed", "run_id", plan.run.ID, "error", resumeErr)
 		}
 		fields := telemetry.Fields{
 			"action":      "finished",
@@ -756,6 +979,28 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 		trackStartFailure("codex_state_root")
 		return "", err
 	}
+	if m.quiescing.Load() {
+		m.handoffMu.Lock()
+		handoffID := m.handoffID
+		m.handoffMu.Unlock()
+		queuedSteps := make([]string, 0, len(skipSteps))
+		for _, step := range skipSteps {
+			queuedSteps = append(queuedSteps, string(step))
+		}
+		admission, queueErr := m.db.EnqueueDaemonAdmission(db.DaemonAdmission{
+			HandoffID: handoffID, RepoID: repo.ID, Branch: branch,
+			HeadSHA: headSHA, BaseSHA: baseSHA, Trigger: trigger,
+			SkipSteps: queuedSteps, Intent: intent,
+			RequiresGitHubPublicationProfile: githubConfigDir != nil,
+			RequiresCodexStateRoot:           codexStateRoot != nil,
+		})
+		if queueErr != nil {
+			trackStartFailure("maintenance_queue")
+			return "", fmt.Errorf("persist admission during daemon handoff: %w", queueErr)
+		}
+		slog.Info("queued run admission during daemon handoff", "admission_id", admission.ID, "repo_id", repo.ID, "branch", branch)
+		return admission.ID, nil
+	}
 
 	// Serialize only admission. Provisioning itself is bounded separately and
 	// must not hold this lock for the duration of a checkout.
@@ -1033,6 +1278,7 @@ func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, he
 		string(cfg.Agent), strings.Join(agentNames(cfg.Agents), ","),
 		cfg.RoutingGeneration, cfg.AgentPathFor(cfg.Agent)), cfg.RoutingGeneration)
 	executor.SetSkippedSteps(skipSteps)
+	executor.SetHandoffCheckpointer(m.checkpointForHandoff)
 
 	// Track executor.
 	m.mu.Lock()
@@ -1047,6 +1293,7 @@ func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, he
 	m.wg.Add(1)
 	go func() {
 		startedAt := time.Now()
+		handoffParked := false
 		defer m.wg.Done()
 		defer close(done)
 		defer func() {
@@ -1076,10 +1323,13 @@ func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, he
 			}
 			cancel(nil)
 			_ = ag.Close()
-			// Close subscriber channels for this run.
-			m.closeSubscribers(run.ID)
+			// A handoff park is non-terminal. Existing stream connections die
+			// with the old daemon, but the run must not be marked completed.
+			if !handoffParked {
+				m.closeSubscribers(run.ID)
+			}
 			// Clean up worktree.
-			if run.BlockedReason == nil {
+			if run.BlockedReason == nil && !handoffParked {
 				if rmErr := git.WorktreeRemove(context.Background(), gateDir, wtDir); rmErr != nil {
 					slog.Warn("failed to remove worktree", "path", wtDir, "error", rmErr)
 				}
@@ -1095,6 +1345,11 @@ func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, he
 		}()
 
 		if err := executor.Execute(runCtx, run, repo, wtDir); err != nil {
+			if errors.Is(err, pipeline.ErrHandoffParked) {
+				handoffParked = true
+				slog.Info("pipeline parked for daemon handoff", "run_id", run.ID)
+				return
+			}
 			fields := telemetry.Fields{
 				"action":      "finished",
 				"trigger":     trigger,

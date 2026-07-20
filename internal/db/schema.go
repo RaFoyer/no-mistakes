@@ -199,6 +199,79 @@ CREATE TABLE IF NOT EXISTS route_result_sequence (
     id       INTEGER PRIMARY KEY CHECK (id = 1),
     next_seq INTEGER NOT NULL
 );
+
+-- The daemon remains a single coordinator. These rows are only the durable
+-- handshake and evidence needed to quiesce that coordinator at safe pipeline
+-- boundaries before replacing it; they do not authorize concurrent daemons.
+CREATE TABLE IF NOT EXISTS daemon_generation (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    generation        TEXT NOT NULL,
+    build             TEXT NOT NULL,
+    protocol_version  INTEGER NOT NULL,
+    schema_version    INTEGER NOT NULL,
+    maintenance_phase TEXT NOT NULL DEFAULT 'active',
+    updated_at        INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daemon_handoffs (
+    id                  TEXT PRIMARY KEY,
+    source_generation   TEXT NOT NULL,
+    target_build        TEXT NOT NULL,
+    target_protocol_min INTEGER NOT NULL,
+    target_protocol_max INTEGER NOT NULL,
+    target_schema_min   INTEGER NOT NULL,
+    target_schema_max   INTEGER NOT NULL,
+    target_path         TEXT NOT NULL,
+    target_sha256       TEXT NOT NULL,
+    rollback_path       TEXT NOT NULL,
+    rollback_sha256     TEXT NOT NULL,
+    phase               TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daemon_handoff_events (
+    id         TEXT PRIMARY KEY,
+    handoff_id TEXT NOT NULL REFERENCES daemon_handoffs(id) ON DELETE CASCADE,
+    phase      TEXT NOT NULL,
+    detail     TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_daemon_handoff_events_order
+    ON daemon_handoff_events (handoff_id, created_at, id);
+
+CREATE TABLE IF NOT EXISTS run_handoff_checkpoints (
+    run_id      TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    handoff_id  TEXT NOT NULL,
+    generation  TEXT NOT NULL,
+    next_step   TEXT NOT NULL,
+    worktree    TEXT NOT NULL,
+    head_sha    TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daemon_admission_queue (
+    id                  TEXT PRIMARY KEY,
+    handoff_id          TEXT NOT NULL,
+    repo_id             TEXT NOT NULL,
+    branch              TEXT NOT NULL,
+    head_sha            TEXT NOT NULL,
+    base_sha            TEXT NOT NULL,
+    trigger             TEXT NOT NULL,
+    skip_steps_json     TEXT NOT NULL DEFAULT '[]',
+    intent              TEXT,
+    requires_github_publication_profile INTEGER NOT NULL DEFAULT 0,
+    requires_codex_state_root INTEGER NOT NULL DEFAULT 0,
+    state               TEXT NOT NULL DEFAULT 'queued',
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_daemon_admission_queue_order
+    ON daemon_admission_queue (handoff_id, state, created_at, id);
 `
 
 // migrationStatements hold additive schema changes applied to databases that

@@ -73,9 +73,15 @@ Safest local verification sequence after non-trivial changes:
 
 **Destructive Daemon Lifecycle Guard (`internal/lifecycle/guard.go`)**
 
-- `daemon stop`, `daemon restart`, and `update` refuse by default while pending/running runs exist (the daemon is machine-wide, so stopping it can fail every active pipeline), list the runs via the shared `lifecycle.ActiveRuns`/`lifecycle.RunList` helpers, and require an explicit `--force`. `update -y` answers only the different-executable prompt and deliberately does not bypass this guard.
-- Every invocation of the three commands is logged with caller attribution (PID, PPID, parent command line) via `logLifecycleInvocation` to `<NM_HOME>/logs/cli.log`; this is the incident forensic trail, do not remove or weaken it.
-- Regressions: `TestDaemonStopRefusesWithActiveRunsAndListsThem`, `TestDaemonStopForceOverridesActiveRunGuard`, `TestDaemonRestartRefusesWithActiveRuns`, `TestLifecycleCommandsWriteCallerAttributionToCLILog` (`internal/cli/daemon_lifecycle_test.go`), `TestUpdaterRunRefusesWithActiveRunsAndListsThem`, `TestUpdaterActiveRunGuardAllowsForce` (`internal/update`).
+- `daemon start`, `daemon stop`, `daemon restart`, and `update` refuse by default while pending/running runs exist (the daemon is machine-wide, so refreshing or stopping it can fail every active pipeline), list the runs via the shared `lifecycle.ActiveRuns`/`lifecycle.RunList` helpers, and require an explicit `--force`. `update -y` answers only the different-executable prompt and deliberately does not bypass this guard.
+- Every invocation of the four commands is logged with caller attribution (PID, PPID, parent command line) via `logLifecycleInvocation` to `<NM_HOME>/logs/cli.log`; this is the incident forensic trail, do not remove or weaken it.
+- Regressions: `TestDaemonStartRefusesWithActiveRuns`, `TestDaemonStopRefusesWithActiveRunsAndListsThem`, `TestDaemonStopForceOverridesActiveRunGuard`, `TestDaemonRestartRefusesWithActiveRuns`, `TestLifecycleCommandsWriteCallerAttributionToCLILog` (`internal/cli/daemon_lifecycle_test.go`), `TestUpdaterRunRefusesWithActiveRunsAndListsThem`, `TestUpdaterActiveRunGuardAllowsForce` (`internal/update`).
+
+**Cooperative Daemon Handoff Foundation**
+
+- Handoff state is durable and append-only in `internal/db/maintenance.go`; the singleton daemon quiesces admission, queues only non-secret notification metadata, and parks a run only after an operation's terminal result is committed at an exact validated step boundary. Never replay commit/push/PR/fixer/merge side effects without durable completion proof.
+- Refuse handoff for unfinished provisioning, an active agent PID, unverifiable worktree/HEAD/step history, process-local GitHub publication-profile or Codex state-root custody, protocol/schema incompatibility, or queued admissions at adoption. Stage exact target and rollback bytes in immutable content-addressed paths before adoption.
+- The updater/service-manager adoption and queued-admission replay are not wired yet, and CI polling has no idle sub-checkpoint. The first handoff-capable baseline still requires a quiet restart. The authoritative capability and limitation contract lives in `docs/src/content/docs/concepts/daemon.md`; do not claim zero-disruption upgrade support until those remaining phases exist.
 
 **Testing Conventions**
 

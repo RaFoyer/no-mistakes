@@ -59,8 +59,8 @@ If pending or running pipeline runs exist, `update` refuses to restart the daemo
 If the daemon is already running from a different executable path, update still prompts before replacing it; `-y`/`--yes` answers that prompt non-interactively.
 If the daemon executable path cannot be determined, the update aborts before replacing anything.
 
-`no-mistakes daemon stop` and `no-mistakes daemon restart` apply the same guard: if pending or running pipeline runs exist, each refuses by default and lists the active runs, and each takes its own `--force` to proceed anyway.
-Every invocation of `daemon stop`, `daemon restart`, or `update` - forced or not - logs the caller's PID, parent PID, and parent command line to `~/.no-mistakes/logs/cli.log` so a later incident can identify which agent or process triggered it.
+`no-mistakes daemon start`, `no-mistakes daemon stop`, and `no-mistakes daemon restart` apply the same guard: if pending or running pipeline runs exist, each refuses by default and lists the active runs, and each takes its own `--force` to proceed anyway. The `start` guard matters when an already-installed managed service needs to be refreshed or restarted.
+Every invocation of `daemon start`, `daemon stop`, `daemon restart`, or `update` - forced or not - logs the caller's PID, parent PID, and parent command line to `~/.no-mistakes/logs/cli.log` so a later incident can identify which agent or process triggered it.
 
 The daemon writes an identity record to `~/.no-mistakes/daemon.pid` and listens on a Unix socket at `~/.no-mistakes/socket`. On Windows, it uses a localhost TCP listener and a protected endpoint file at the same path. CLI clients bound how long they wait for that socket to accept a connection with `daemon_connect_timeout` (default `3s`, override with `NM_DAEMON_CONNECT_TIMEOUT`), so a daemon process that is alive but stuck fails the connection instead of hanging the caller; see [Troubleshooting](/no-mistakes/guides/troubleshooting/#check-for-stale-artifacts).
 Commands that ensure the daemon is running (`no-mistakes`, `init`, `attach`, `rerun`, `axi run`, `axi respond`) also fail fast rather than silently starting a replacement daemon when the socket file exists but nothing answers at all, such as a dead socket left behind by an unclean exit; `no-mistakes daemon start` self-heals past that case.
@@ -116,8 +116,49 @@ If you push to the same branch while a run is already active, the daemon:
 
 Pushes to different branches run concurrently.
 
+Runs in different repositories also run concurrently when they use the same
+`NM_HOME`. The shared daemon is a per-`NM_HOME` coordinator, not a serial
+pipeline worker: one daemon owns global admission, durable state, and worktree
+lifecycle while independent branch runs execute in parallel.
+
 This is another reason the daemon exists: branch-level coordination is easier to
 reason about in one long-lived process than inside independent hook invocations.
+
+## Cooperative daemon handoff foundation
+
+No Mistakes has a fail-closed foundation for replacing that single coordinator
+without treating active pipelines as crashed. A handoff keeps the singleton
+ownership model and proceeds through durable, append-only maintenance phases:
+
+1. Record the source daemon generation, target build, compatible protocol and
+   schema ranges, and the exact target and rollback artifact hashes.
+2. Quiesce new admission. Notifications received after quiescence are stored in
+   a durable FIFO queue; they are not turned into partial runs or silently lost.
+3. Let an executing operation finish and commit its terminal result. A run may
+   park only between steps, after its worktree path, HEAD, exact step plan, and
+   next step have been validated and durably checkpointed.
+4. Allow a compatible target generation to adopt the checkpointed state. The
+   old generation remains authoritative until adoption succeeds, and automatic
+   rollback is forbidden after the target has been declared adopted.
+
+The daemon refuses to checkpoint a run with an active agent process, unfinished
+worktree provisioning, unverifiable worktree or HEAD, ambiguous step history,
+or process-local custody of a GitHub publication profile or Codex state root.
+Adoption is also refused while queued admissions remain. These boundaries keep
+restart recovery from replaying side effects such as commits, pushes, pull
+requests, fixer turns, or merges without durable proof that replay is safe.
+
+Target and rollback executable bytes are prepared before adoption in immutable,
+content-addressed version paths. Preparing those artifacts never replaces the
+live executable, so an invalid or tampered target leaves the current generation
+authoritative.
+
+This is currently a protocol and checkpointing foundation, not an enabled
+zero-disruption updater. The updater and service manager do not yet drive the
+handoff phases, a target generation does not yet replay the queued admission
+FIFO, and CI polling has no idle sub-checkpoint. A run that is inside such an
+operation must therefore wait or make the handoff fail closed. Installing the
+first handoff-capable baseline still requires one ordinary quiet restart window.
 
 ## Crash recovery
 
@@ -138,7 +179,7 @@ were active):
 
 ## Logging
 
-Daemon logs go to `~/.no-mistakes/logs/daemon.log`. The setup wizard captures managed agent-server output in `~/.no-mistakes/logs/wizard-agent.log`. Each pipeline step also writes to its own log at `~/.no-mistakes/logs/<runID>/<step>.log`, and fatal step errors are appended there so the step log includes the failure reason even when the detail comes from command stderr. `daemon stop`, `daemon restart`, and `update` invocations are logged separately to `~/.no-mistakes/logs/cli.log` with the caller's PID, parent PID, and parent command line.
+Daemon logs go to `~/.no-mistakes/logs/daemon.log`. The setup wizard captures managed agent-server output in `~/.no-mistakes/logs/wizard-agent.log`. Each pipeline step also writes to its own log at `~/.no-mistakes/logs/<runID>/<step>.log`, and fatal step errors are appended there so the step log includes the failure reason even when the detail comes from command stderr. `daemon start`, `daemon stop`, `daemon restart`, and `update` invocations are logged separately to `~/.no-mistakes/logs/cli.log` with the caller's PID, parent PID, and parent command line.
 
 Set the log level in global config:
 

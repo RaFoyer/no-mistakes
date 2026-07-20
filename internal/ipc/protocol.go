@@ -189,7 +189,14 @@ type CancelRunResult struct {
 
 // HealthResult confirms the daemon is alive.
 type HealthResult struct {
-	Status string `json:"status"`
+	Status           string `json:"status"`
+	Generation       string `json:"generation,omitempty"`
+	Build            string `json:"build,omitempty"`
+	HandoffProtocol  int    `json:"handoff_protocol,omitempty"`
+	SchemaVersion    int    `json:"schema_version,omitempty"`
+	MaintenancePhase string `json:"maintenance_phase,omitempty"`
+	HandoffID        string `json:"handoff_id,omitempty"`
+	QueuedAdmissions int    `json:"queued_admissions,omitempty"`
 }
 
 // ShutdownResult confirms shutdown was initiated.
