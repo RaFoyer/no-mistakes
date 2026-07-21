@@ -201,13 +201,16 @@ func (h *Harness) writeGlobalConfig() {
 	cursorConfig := ""
 	if h.agentName == "cursor" {
 		profile := filepath.Join(h.RootDir, "cursor-profile")
-		if err := os.MkdirAll(profile, 0o700); err != nil {
-			h.t.Fatalf("mkdir fake cursor profile: %v", err)
+		home := filepath.Join(h.RootDir, "cursor-home")
+		for _, dir := range []string{profile, home} {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				h.t.Fatalf("mkdir fake cursor private directory: %v", err)
+			}
+			if err := os.Chmod(dir, 0o700); err != nil {
+				h.t.Fatalf("chmod fake cursor private directory: %v", err)
+			}
 		}
-		if err := os.Chmod(profile, 0o700); err != nil {
-			h.t.Fatalf("chmod fake cursor profile: %v", err)
-		}
-		cursorConfig = "cursor_config_dir: " + profile + "\n"
+		cursorConfig = "cursor_config_dir: " + profile + "\ncursor_home_dir: " + home + "\n"
 	}
 	cfg := fmt.Sprintf(`agent: %s
 %slog_level: debug

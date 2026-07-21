@@ -75,7 +75,7 @@ Override the default agent for this repo and its setup-wizard suggestions.
 `auto` resolves to the first supported native agent found on `PATH` in this order: `claude`, `codex`, `opencode`, `acli` with `rovodev` support, `pi`, then `copilot`.
 `acp:<target>` uses the user-installed `acpx` binary configured in global config.
 ACP agents are opt-in and are not considered by `agent: auto`.
-Cursor is explicit-only, requires the global `cursor_config_dir`, and is not considered by `agent: auto`.
+Cursor is explicit-only, requires the global `cursor_config_dir` and `cursor_home_dir`, and is not considered by `agent: auto`.
 The effective agent configuration must resolve to a runnable runner before a new validation gate starts.
 If the selected explicit agent or `auto` is unavailable, the gate fails before its first pipeline step rather than reporting partial validation as passed.
 

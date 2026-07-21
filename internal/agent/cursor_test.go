@@ -205,17 +205,20 @@ func TestCursorCancellationIsNotAuth(t *testing.T) {
 }
 
 func TestCursorProcessEnvReplacesAmbientCredentials(t *testing.T) {
+	t.Setenv("HOME", "/ambient-home")
 	t.Setenv("CURSOR_CONFIG_DIR", "/ambient")
 	t.Setenv("AGENT_CLI_CREDENTIAL_STORE", "keychain")
 	t.Setenv("CURSOR_API_KEY", "secret")
-	env := cursorProcessEnv(context.Background(), t.TempDir(), "/isolated")
+	t.Setenv("CURSOR_ACCESS_TOKEN", "access-secret")
+	t.Setenv("CURSOR_REFRESH_TOKEN", "refresh-secret")
+	env := cursorProcessEnv(context.Background(), t.TempDir(), "/isolated-home", "/isolated-profile")
 	joined := strings.Join(env, "\n")
-	for _, forbidden := range []string{"/ambient", "CURSOR_API_KEY=secret", "AGENT_CLI_CREDENTIAL_STORE=keychain"} {
+	for _, forbidden := range []string{"HOME=/ambient-home", "CURSOR_CONFIG_DIR=/ambient", "CURSOR_API_KEY=secret", "CURSOR_ACCESS_TOKEN=access-secret", "CURSOR_REFRESH_TOKEN=refresh-secret", "AGENT_CLI_CREDENTIAL_STORE=keychain"} {
 		if strings.Contains(joined, forbidden) {
 			t.Fatalf("ambient Cursor credential source survived: %q", forbidden)
 		}
 	}
-	for _, required := range []string{"CURSOR_CONFIG_DIR=/isolated", "AGENT_CLI_CREDENTIAL_STORE=file", "NO_OPEN_BROWSER=1"} {
+	for _, required := range []string{"HOME=/isolated-home", "CURSOR_CONFIG_DIR=/isolated-profile", "AGENT_CLI_CREDENTIAL_STORE=file", "NO_OPEN_BROWSER=1"} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("missing isolated env %q", required)
 		}
@@ -255,6 +258,36 @@ func TestCursorConfigDirMustBePrivateAndNotSymlinked(t *testing.T) {
 	}
 	if err := validateCursorConfigDir(link); err == nil {
 		t.Fatal("expected symlink refusal")
+	}
+}
+
+func TestCursorHomeDirMustBePrivateAndNotSymlinked(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCursorHomeDir(home); err != nil {
+		t.Fatal(err)
+	}
+	unsafeFile := filepath.Join(home, "credentials.json")
+	if err := os.WriteFile(unsafeFile, []byte("opaque"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCursorHomeDir(home); err == nil || !strings.Contains(err.Error(), "0600") {
+		t.Fatalf("error = %v, want non-private credential-home file refusal", err)
+	}
+	if err := os.Chmod(unsafeFile, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCursorHomeDir(home); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "home")
+	if err := os.Symlink(home, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCursorHomeDir(link); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("error = %v, want symlink refusal", err)
 	}
 }
 

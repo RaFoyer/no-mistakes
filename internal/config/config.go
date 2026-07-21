@@ -54,6 +54,7 @@ type GlobalConfig struct {
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
 	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
 	CursorConfigDir      string              `yaml:"cursor_config_dir"`
+	CursorHomeDir        string              `yaml:"cursor_home_dir"`
 	CITimeout            time.Duration       `yaml:"-"`
 	StepQuietWarning     time.Duration       `yaml:"-"`
 	DaemonConnectTimeout time.Duration       `yaml:"-"`
@@ -79,6 +80,7 @@ type globalConfigRaw struct {
 	AgentPathOverride    map[string]string   `yaml:"agent_path_override"`
 	AgentArgsOverride    map[string][]string `yaml:"agent_args_override"`
 	CursorConfigDir      string              `yaml:"cursor_config_dir"`
+	CursorHomeDir        string              `yaml:"cursor_home_dir"`
 	CITimeout            string              `yaml:"ci_timeout"`
 	DaemonConnectTimeout string              `yaml:"daemon_connect_timeout"`
 	BabysitTimeout       string              `yaml:"babysit_timeout"`
@@ -201,6 +203,7 @@ type Config struct {
 	AgentPathOverride    map[string]string
 	AgentArgsOverride    map[string][]string
 	CursorConfigDir      string
+	CursorHomeDir        string
 	CITimeout            time.Duration
 	StepQuietWarning     time.Duration
 	LogLevel             string
@@ -336,9 +339,10 @@ agent: auto
 # acp_registry_overrides:
 #   local-gemini: node /opt/mock-acp-agent.mjs
 
-# Required for explicit agent: cursor. This must be an absolute, private
-# repository-scoped Cursor profile; ambient Cursor auth is never inherited.
+# Required for explicit agent: cursor. Both must be absolute, private,
+# repository-scoped directories; ambient Cursor auth is never inherited.
 # cursor_config_dir: /Users/you/.config/agent-connectors/owner%2Frepo/cursor/profile
+# cursor_home_dir: /Users/you/.config/agent-connectors/owner%2Frepo/cursor/home
 
 # Maximum time the CI monitor babysits an open PR with no base-branch movement
 # before giving up. The monitor watches CI and auto-rebases when the base branch
@@ -840,6 +844,12 @@ func LoadGlobal(path string) (*GlobalConfig, error) {
 		}
 		cfg.CursorConfigDir = filepath.Clean(raw.CursorConfigDir)
 	}
+	if raw.CursorHomeDir != "" {
+		if !filepath.IsAbs(raw.CursorHomeDir) {
+			return nil, fmt.Errorf("cursor_home_dir must be an absolute path")
+		}
+		cfg.CursorHomeDir = filepath.Clean(raw.CursorHomeDir)
+	}
 	timeoutValue := raw.CITimeout
 	if timeoutValue == "" {
 		timeoutValue = raw.BabysitTimeout
@@ -1157,6 +1167,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		AgentPathOverride:    global.AgentPathOverride,
 		AgentArgsOverride:    global.AgentArgsOverride,
 		CursorConfigDir:      global.CursorConfigDir,
+		CursorHomeDir:        global.CursorHomeDir,
 		CITimeout:            global.CITimeout,
 		StepQuietWarning:     global.StepQuietWarning,
 		LogLevel:             global.LogLevel,

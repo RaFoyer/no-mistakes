@@ -51,6 +51,23 @@ func TestNewWithOptionsBindsCodexStateRootOnlyToCodex(t *testing.T) {
 	}
 }
 
+func TestNewWithOptionsBindsCursorRootsOnlyToCursor(t *testing.T) {
+	ag, err := NewWithOptions(types.AgentCursor, "cursor-agent", nil, Options{
+		CursorConfigDir: "/private/cursor/profile",
+		CursorHomeDir:   "/private/cursor/home",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor, ok := ag.(*cursorAgent)
+	if !ok {
+		t.Fatalf("adapter = %T, want native Cursor", ag)
+	}
+	if cursor.configDir != "/private/cursor/profile" || cursor.homeDir != "/private/cursor/home" {
+		t.Fatalf("Cursor custody = %#v, want explicit config and credential-home roots", cursor)
+	}
+}
+
 func TestNew_KnownAgents(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -10,8 +10,9 @@ Global configuration lives at `~/.no-mistakes/config.yaml`. Set `NM_HOME` to rel
 
 agent: auto
 
-# Required only when agent includes cursor.
+# Both are required when agent includes cursor.
 cursor_config_dir: /Users/you/.config/agent-connectors/owner%2Frepo/cursor/profile
+cursor_home_dir: /Users/you/.config/agent-connectors/owner%2Frepo/cursor/home
 
 acpx_path: acpx
 
@@ -103,12 +104,23 @@ Cursor project-instruction suppression is not verified. A repository with `disab
 
 ### cursor_config_dir
 
-Absolute path to the repository-scoped Cursor Agent profile used by an explicit `cursor` entry. The adapter requires a real private `0700` directory, selects file-backed credentials with `AGENT_CLI_CREDENTIAL_STORE=file`, disables browser launch, removes ambient `CURSOR_API_KEY` and Cursor profile variables, and never reads credential contents into no-mistakes.
+Absolute path to the repository-scoped Cursor Agent profile used by an explicit `cursor` entry. The adapter requires a real private `0700` directory. Every contained directory must be `0700`, every contained file must be regular and `0600`, and symlinks, hard links, special files, and foreign ownership are refused.
 
 |         |                                  |
 | ------- | -------------------------------- |
 | Type    | `string`                         |
 | Default | Empty (Cursor launch is refused) |
+
+### cursor_home_dir
+
+Absolute path to the repository-scoped home used for every Cursor version probe, authentication probe, and model invocation. It has the same private-tree requirements as `cursor_config_dir`. The adapter replaces ambient `HOME`, selects file-backed credentials with `AGENT_CLI_CREDENTIAL_STORE=file`, disables browser launch, removes ambient Cursor credential variables, and never reads credential contents into no-mistakes.
+
+|         |                                  |
+| ------- | -------------------------------- |
+| Type    | `string`                         |
+| Default | Empty (Cursor launch is refused) |
+
+Before each model invocation, no-mistakes runs a five-second, size-bounded `cursor-agent status --format json` probe under the exact same isolated environment. It proceeds only when the status and access/refresh-token fields all report authenticated.
 
 ### acpx_path
 

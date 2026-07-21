@@ -458,6 +458,7 @@ func newPipelineAgent(ctx context.Context, cfg *config.Config, lookPath func(str
 			DisableProjectSettings: cfg.DisableProjectSettings,
 			IsolateCodexHome:       name == types.AgentCodex,
 			CursorConfigDir:        cfg.CursorConfigDir,
+			CursorHomeDir:          cfg.CursorHomeDir,
 		}
 		next, err := agent.NewWithOptions(name, cfg.AgentPathFor(name), cfg.AgentArgsFor(name), agentOptions)
 		if err != nil {
@@ -1232,6 +1233,7 @@ func (m *RunManager) provisionRun(ctx context.Context, repo *db.Repo, branch, he
 				DisableProjectSettings: cfg.DisableProjectSettings,
 				IsolateCodexHome:       name == types.AgentCodex,
 				CursorConfigDir:        cfg.CursorConfigDir,
+				CursorHomeDir:          cfg.CursorHomeDir,
 			}
 			if name == types.AgentCodex {
 				agentOptions.CodexStateRoot = codexStateRoot

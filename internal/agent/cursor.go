@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/routing"
 	"github.com/kunchenguid/no-mistakes/internal/shellenv"
@@ -24,6 +25,8 @@ const (
 	cursorModelMedium      = "cursor-grok-4.5-medium"
 	cursorModelHigh        = "cursor-grok-4.5-high"
 	cursorMaxPromptBytes   = 16 << 20
+	cursorMaxStatusBytes   = 64 << 10
+	cursorStatusTimeout    = 5 * time.Second
 )
 
 var cursorDisplayModels = map[string]string{
@@ -39,6 +42,9 @@ type cursorAgent struct {
 	bin       string
 	extraArgs []string
 	configDir string
+	homeDir   string
+	// statusTimeout is overridden only by focused timeout tests.
+	statusTimeout time.Duration
 }
 
 func (a *cursorAgent) Name() string               { return "cursor" }
@@ -55,7 +61,10 @@ func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	if a.configDir == "" {
 		return nil, fmt.Errorf("cursor config directory is required; set cursor_config_dir in the global config")
 	}
-	if err := validateCursorConfigDir(a.configDir); err != nil {
+	if a.homeDir == "" {
+		return nil, fmt.Errorf("cursor home directory is required; set cursor_home_dir in the global config")
+	}
+	if err := a.validatePrivateRoots(); err != nil {
 		return nil, err
 	}
 	stdinPrompt, err := cursorStdinPrompt(opts.Prompt, opts.JSONSchema)
@@ -70,6 +79,14 @@ func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 		return nil, err
 	}
 	if err := a.checkVersion(ctx, opts.CWD, resolvedBin); err != nil {
+		return nil, err
+	}
+	if err := a.checkAuthentication(ctx, opts.CWD, resolvedBin); err != nil {
+		return nil, err
+	}
+	// The probes run under these roots too. Revalidate before model startup so
+	// an updater or token refresh cannot introduce a permissive credential file.
+	if err := a.validatePrivateRoots(); err != nil {
 		return nil, err
 	}
 
@@ -89,7 +106,7 @@ func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	cmd := exec.CommandContext(ctx, resolvedBin, a.buildArgs(model, fix)...)
 	cmd.Dir = opts.CWD
 	cmd.Stdin = strings.NewReader(stdinPrompt)
-	cmd.Env = cursorProcessEnv(ctx, opts.CWD, a.configDir)
+	cmd.Env = cursorProcessEnv(ctx, opts.CWD, a.homeDir, a.configDir)
 	shellenv.ConfigureShellCommand(cmd)
 
 	started, err := startNativeAgentCommand(cmd)
@@ -148,7 +165,7 @@ func resolveCursorBinary(bin string) (string, error) {
 func (a *cursorAgent) checkVersion(ctx context.Context, cwd, bin string) error {
 	cmd := exec.CommandContext(ctx, bin, "--version")
 	cmd.Dir = cwd
-	cmd.Env = cursorProcessEnv(ctx, cwd, a.configDir)
+	cmd.Env = cursorProcessEnv(ctx, cwd, a.homeDir, a.configDir)
 	out, err := shellenv.CombinedOutputShellCommand(cmd)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -179,54 +196,143 @@ func cursorStdinPrompt(prompt string, schema json.RawMessage) (string, error) {
 }
 
 func validateCursorConfigDir(path string) error {
+	return validateCursorPrivateTree(path, "config directory", "isolated Cursor profile is absent; interactive login is disabled for daemon launches")
+}
+
+func (a *cursorAgent) validatePrivateRoots() error {
+	if err := validateCursorConfigDir(a.configDir); err != nil {
+		return err
+	}
+	return validateCursorHomeDir(a.homeDir)
+}
+
+func validateCursorHomeDir(path string) error {
+	return validateCursorPrivateTree(path, "home directory", "isolated Cursor credential home is absent; interactive login is disabled for daemon launches")
+}
+
+func validateCursorPrivateTree(path, label, missingDetail string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("cursor %s must be an absolute path", label)
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return &AuthorizationRequiredError{Agent: "cursor", Detail: "isolated Cursor profile is absent; interactive login is disabled for daemon launches"}
+			return &AuthorizationRequiredError{Agent: "cursor", Detail: missingDetail}
 		}
-		return fmt.Errorf("cursor config directory: %w", err)
+		return fmt.Errorf("cursor %s: %w", label, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return fmt.Errorf("cursor config directory must be a real directory, not a symlink")
+		return fmt.Errorf("cursor %s must be a real directory, not a symlink", label)
 	}
 	if info.Mode().Perm() != 0o700 {
-		return fmt.Errorf("cursor config directory %q has mode %04o; require private mode 0700", path, info.Mode().Perm())
+		return fmt.Errorf("cursor %s %q has mode %04o; require private mode 0700", label, path, info.Mode().Perm())
 	}
 	return filepath.WalkDir(path, func(current string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return fmt.Errorf("cursor profile metadata %q: %w", current, walkErr)
+			return fmt.Errorf("cursor private tree metadata %q: %w", current, walkErr)
 		}
 		entryInfo, err := entry.Info()
 		if err != nil {
-			return fmt.Errorf("cursor profile metadata %q: %w", current, err)
+			return fmt.Errorf("cursor private tree metadata %q: %w", current, err)
 		}
 		if entry.Type()&os.ModeSymlink != 0 || entryInfo.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("cursor profile contains symlink %q", current)
+			return fmt.Errorf("cursor private tree contains symlink %q", current)
 		}
 		if !entryInfo.IsDir() && !entryInfo.Mode().IsRegular() {
-			return fmt.Errorf("cursor profile entry %q must be a regular file or directory", current)
+			return fmt.Errorf("cursor private tree entry %q must be a regular file or directory", current)
 		}
 		wantMode := os.FileMode(0o600)
 		if entryInfo.IsDir() {
 			wantMode = 0o700
 		}
 		if entryInfo.Mode().Perm() != wantMode {
-			return fmt.Errorf("cursor profile entry %q has mode %04o; require %04o", current, entryInfo.Mode().Perm(), wantMode)
+			return fmt.Errorf("cursor private tree entry %q has mode %04o; require %04o", current, entryInfo.Mode().Perm(), wantMode)
 		}
-		return validateCursorProfileOwnership(current, entryInfo)
+		return validateCursorPrivateTreeOwnership(current, entryInfo)
 	})
 }
 
-func cursorProcessEnv(ctx context.Context, cwd, configDir string) []string {
+func cursorProcessEnv(ctx context.Context, cwd, homeDir, configDir string) []string {
 	env := nonCodexProcessEnv(ctx, cwd)
-	for _, key := range []string{"CURSOR_CONFIG_DIR", "AGENT_CLI_CREDENTIAL_STORE", "CURSOR_API_KEY", "NO_OPEN_BROWSER"} {
+	for _, key := range []string{"HOME", "CURSOR_CONFIG_DIR", "AGENT_CLI_CREDENTIAL_STORE", "CURSOR_API_KEY", "CURSOR_ACCESS_TOKEN", "CURSOR_REFRESH_TOKEN", "NO_OPEN_BROWSER"} {
 		env = withoutEnvKey(env, key)
 	}
 	return append(env,
+		"HOME="+homeDir,
 		"CURSOR_CONFIG_DIR="+configDir,
 		"AGENT_CLI_CREDENTIAL_STORE=file",
 		"NO_OPEN_BROWSER=1",
 	)
+}
+
+type cursorAuthenticationStatus struct {
+	Status          string `json:"status"`
+	IsAuthenticated bool   `json:"isAuthenticated"`
+	HasAccessToken  bool   `json:"hasAccessToken"`
+	HasRefreshToken bool   `json:"hasRefreshToken"`
+}
+
+type cursorBoundedOutput struct {
+	buf      bytes.Buffer
+	exceeded bool
+}
+
+func (w *cursorBoundedOutput) Write(p []byte) (int, error) {
+	remaining := cursorMaxStatusBytes - w.buf.Len()
+	if remaining > 0 {
+		if len(p) < remaining {
+			remaining = len(p)
+		}
+		_, _ = w.buf.Write(p[:remaining])
+	}
+	if len(p) > remaining {
+		w.exceeded = true
+	}
+	return len(p), nil
+}
+
+func (a *cursorAgent) checkAuthentication(ctx context.Context, cwd, bin string) error {
+	timeout := a.statusTimeout
+	if timeout <= 0 {
+		timeout = cursorStatusTimeout
+	}
+	statusCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(statusCtx, bin, "status", "--format", "json")
+	cmd.Dir = cwd
+	cmd.Env = cursorProcessEnv(statusCtx, cwd, a.homeDir, a.configDir)
+	shellenv.ConfigureShellCommand(cmd)
+	var stdout, stderr cursorBoundedOutput
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := shellenv.RunShellCommand(cmd)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if errors.Is(statusCtx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("cursor authentication status probe timed out after %s", timeout)
+	}
+	if err != nil {
+		if statusCtx.Err() != nil {
+			return statusCtx.Err()
+		}
+		return cursorCommandError("authentication status probe", err, stderr.buf.String())
+	}
+	if stdout.exceeded || stderr.exceeded {
+		return fmt.Errorf("cursor authentication status exceeded %d bytes", cursorMaxStatusBytes)
+	}
+	var status cursorAuthenticationStatus
+	if err := json.Unmarshal(stdout.buf.Bytes(), &status); err != nil {
+		return fmt.Errorf("cursor authentication status is not valid JSON: %w", err)
+	}
+	if status.Status != "authenticated" || !status.IsAuthenticated || !status.HasAccessToken || !status.HasRefreshToken {
+		return cursorAuthorizationRequired()
+	}
+	return nil
+}
+
+func cursorAuthorizationRequired() error {
+	return &AuthorizationRequiredError{Agent: "cursor", Detail: "isolated Cursor credential home requires authentication; run cursor-agent login with the configured HOME, CURSOR_CONFIG_DIR, AGENT_CLI_CREDENTIAL_STORE=file, and NO_OPEN_BROWSER=1"}
 }
 
 func (a *cursorAgent) buildArgs(model string, fix bool) []string {
@@ -361,7 +467,7 @@ func parseCursorEvents(ctx context.Context, r io.Reader, requestedModel string, 
 			}
 			if event.Subtype != "success" || event.IsError {
 				if authorizationRequiredText(event.Result) {
-					return nil, &AuthorizationRequiredError{Agent: "cursor", Detail: "isolated Cursor profile requires authentication; interactive login is disabled for daemon launches"}
+					return nil, cursorAuthorizationRequired()
 				}
 				if label, transient := classifyTransient(fmt.Errorf("%s", event.Result)); transient {
 					return nil, fmt.Errorf("cursor terminal result %q: %s", event.Subtype, label)
@@ -413,7 +519,7 @@ func cursorCommandError(stage string, err error, stderr string) error {
 	detail := strings.TrimSpace(stderr)
 	combined := strings.TrimSpace(strings.Join([]string{err.Error(), detail}, ": "))
 	if authorizationRequiredText(combined) {
-		return &AuthorizationRequiredError{Agent: "cursor", Detail: "isolated Cursor profile requires authentication; interactive login is disabled for daemon launches"}
+		return cursorAuthorizationRequired()
 	}
 	if label, transient := classifyTransient(fmt.Errorf("%s", combined)); transient {
 		return fmt.Errorf("cursor %s: %s", stage, label)

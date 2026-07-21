@@ -320,6 +320,9 @@ type Options struct {
 	// CursorConfigDir is the explicit repository connector profile. Cursor
 	// refuses to launch without it and never inherits ambient Cursor auth.
 	CursorConfigDir string
+	// CursorHomeDir is the explicit repository connector credential home.
+	// Cursor uses it as HOME for every probe and model invocation.
+	CursorHomeDir string
 	// DisableProjectSettings, when true, asks a supported adapter (codex,
 	// claude) to launch with the target repo's project-level agent
 	// settings/instructions suppressed. It is the resolved, trusted-only opt-out
@@ -876,7 +879,7 @@ func NewWithOptions(name types.AgentName, bin string, extraArgs []string, opts O
 	case types.AgentCodex:
 		return &codexAgent{bin: bin, extraArgs: extraArgs, disableProjectSettings: opts.DisableProjectSettings, stateRoot: opts.CodexStateRoot, isolateCodexHome: opts.IsolateCodexHome}, nil
 	case types.AgentCursor:
-		return &cursorAgent{bin: bin, extraArgs: extraArgs, configDir: opts.CursorConfigDir}, nil
+		return &cursorAgent{bin: bin, extraArgs: extraArgs, configDir: opts.CursorConfigDir, homeDir: opts.CursorHomeDir}, nil
 	case types.AgentRovoDev:
 		return &rovodevAgent{bin: bin, extraArgs: extraArgs}, nil
 	case types.AgentOpenCode:

@@ -12,6 +12,10 @@ func runCursor(args []string, scenario *Scenario) int {
 		fmt.Fprintln(os.Stdout, "2026.07.17-3e2a980")
 		return 0
 	}
+	if len(args) == 3 && args[0] == "status" && args[1] == "--format" && args[2] == "json" {
+		fmt.Fprintln(os.Stdout, `{"status":"authenticated","isAuthenticated":true,"hasAccessToken":true,"hasRefreshToken":true}`)
+		return 0
+	}
 	prompt, err := io.ReadAll(io.LimitReader(os.Stdin, (16<<20)+1))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fakeagent: read cursor stdin: %v\n", err)

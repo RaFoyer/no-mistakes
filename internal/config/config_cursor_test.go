@@ -13,8 +13,9 @@ import (
 func TestLoadGlobalCursorNativeProvider(t *testing.T) {
 	dir := t.TempDir()
 	profile := filepath.Join(dir, "cursor-profile")
+	home := filepath.Join(dir, "cursor-home")
 	path := filepath.Join(dir, "config.yaml")
-	data := "agent: cursor\ncursor_config_dir: " + profile + "\n"
+	data := "agent: cursor\ncursor_config_dir: " + profile + "\ncursor_home_dir: " + home + "\n"
 	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -22,11 +23,11 @@ func TestLoadGlobalCursorNativeProvider(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Agent != types.AgentCursor || cfg.CursorConfigDir != profile {
+	if cfg.Agent != types.AgentCursor || cfg.CursorConfigDir != profile || cfg.CursorHomeDir != home {
 		t.Fatalf("cursor config = %+v", cfg)
 	}
 	merged := Merge(cfg, &RepoConfig{})
-	if merged.CursorConfigDir != profile || merged.AgentPathFor(types.AgentCursor) != "cursor-agent" {
+	if merged.CursorConfigDir != profile || merged.CursorHomeDir != home || merged.AgentPathFor(types.AgentCursor) != "cursor-agent" {
 		t.Fatalf("merged cursor config = %+v", merged)
 	}
 }
@@ -38,6 +39,16 @@ func TestLoadGlobalCursorConfigDirMustBeAbsolute(t *testing.T) {
 	}
 	if _, err := LoadGlobal(path); err == nil || !strings.Contains(err.Error(), "absolute") {
 		t.Fatalf("error = %v, want absolute-path refusal", err)
+	}
+}
+
+func TestLoadGlobalCursorHomeDirMustBeAbsolute(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte("agent: cursor\ncursor_config_dir: /private/profile\ncursor_home_dir: relative/home\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadGlobal(path); err == nil || !strings.Contains(err.Error(), "cursor_home_dir") || !strings.Contains(err.Error(), "absolute") {
+		t.Fatalf("error = %v, want cursor_home_dir absolute-path refusal", err)
 	}
 }
 

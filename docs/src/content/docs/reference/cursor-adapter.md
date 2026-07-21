@@ -8,13 +8,28 @@ The native `cursor` provider is explicit-only and production activation remains 
 ## Compatibility contract
 
 - Supported Cursor Agent CLI: `2026.07.17-3e2a980` exactly. Every invocation probes the version and fails closed on drift.
-- Authentication: an absolute repository-scoped `cursor_config_dir` with private `0700` mode; launches force `AGENT_CLI_CREDENTIAL_STORE=file`, disable browser opening, and remove ambient Cursor credential/profile variables.
+- Authentication: absolute repository-scoped `cursor_config_dir` and `cursor_home_dir` private trees. Version probes, authentication probes, and model calls all replace `HOME` and `CURSOR_CONFIG_DIR`, force `AGENT_CLI_CREDENTIAL_STORE=file`, disable browser opening, and remove ambient Cursor credential variables. A bounded five-second `cursor-agent status --format json` preflight must prove authenticated status plus access and refresh tokens before model startup.
 - Transport: prompts, diffs, and schema instructions travel on bounded stdin, never argv. Output uses `--print --output-format stream-json` and requires one initialization event and one successful terminal result.
 - Models: routine work pins `cursor-grok-4.5-medium`; deliberate high-risk review confirmation pins `cursor-grok-4.5-high`. Cursor Auto and Fast variants are not production routes.
 - Permissions: reviews use read-only ask mode. Mutating duties require Cursor sandboxing, the daemon's isolated-worktree marker, a verified linked Git worktree, and adapter-managed `--force`. Cursor's own worktree feature is disabled.
 - Extensions: MCP auto-approval, plugins, extra directories, worktree setup, API keys, headers, and permission/model/session overrides are reserved and cannot be injected through `agent_args_override`.
 
 Cursor has no verified project-instruction suppression mechanism in this supported CLI. In an isolated probe, `AGENTS.md` required the marker `PROJECT_INSTRUCTION_LOADED` while the direct ask-mode prompt required a conflicting marker; Cursor returned `PROJECT_INSTRUCTION_LOADED`. Accordingly, `disable_project_settings: true` refuses Cursor, including as a fallback member. This boundary must remain until a version-pinned suppression mechanism covers `.cursor/rules`, `AGENTS.md`, and `CLAUDE.md` empirically.
+
+## Isolated authentication setup
+
+Create repository-specific `profile` and `home` directories with mode `0700`, then authenticate the supported Cursor binary once under that exact environment. Replace the two example paths with the absolute values configured in `cursor_config_dir` and `cursor_home_dir`:
+
+```sh
+env -u CURSOR_API_KEY -u CURSOR_ACCESS_TOKEN -u CURSOR_REFRESH_TOKEN \
+  HOME='/Users/you/.config/agent-connectors/owner%2Frepo/cursor/home' \
+  CURSOR_CONFIG_DIR='/Users/you/.config/agent-connectors/owner%2Frepo/cursor/profile' \
+  AGENT_CLI_CREDENTIAL_STORE=file \
+  NO_OPEN_BROWSER=1 \
+  /Users/you/.local/bin/cursor-agent login
+```
+
+The login is intentionally operator-run and interactive. Daemon launches never open a browser and never fall back to the operator's ambient home, profile, keychain, API key, or tokens. Keep both roots private: all directories must be `0700`; all files must be regular, single-linked, current-user-owned, and `0600`; symlinks and special files are refused. A missing root or unauthenticated status parks the run as authorization-required rather than starting the model or moving to a fallback provider.
 
 ## Model evidence
 
