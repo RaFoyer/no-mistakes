@@ -33,6 +33,10 @@ var recoveredConfigFetchTimeout = 10 * time.Second
 
 var fetchRecoveredRemoteBranch = git.FetchRemoteBranch
 
+var handoffHeadVerifyTimeout = 10 * time.Second
+
+var handoffHeadSHA = git.HeadSHA
+
 // RunManager tracks active pipeline executors and manages run lifecycle.
 type RunManager struct {
 	mu               sync.Mutex
@@ -173,7 +177,9 @@ func (m *RunManager) checkpointForHandoff(request pipeline.HandoffCheckpointRequ
 	if storedRun.RequiresGitHubPublicationProfile || storedRun.RequiresCodexStateRoot {
 		return false, fmt.Errorf("handoff cannot preserve publication profile or state-root custody")
 	}
-	headSHA, err := git.HeadSHA(context.Background(), request.WorkDir)
+	headCtx, cancel := context.WithTimeout(context.Background(), handoffHeadVerifyTimeout)
+	defer cancel()
+	headSHA, err := handoffHeadSHA(headCtx, request.WorkDir)
 	if err != nil {
 		return false, fmt.Errorf("verify handoff worktree HEAD: %w", err)
 	}
@@ -529,18 +535,6 @@ func (m *RunManager) resumeProvisioningRuns(runs []*db.Run) {
 		m.provisionCancels[run.ID] = cancel
 		m.dones[run.ID] = done
 		m.mu.Unlock()
-		select {
-		case m.provisionQueue <- struct{}{}:
-		default:
-			slog.Warn("provisioning recovery queue is full", "run_id", run.ID)
-			cancel(fmt.Errorf("provisioning recovery queue is full"))
-			m.mu.Lock()
-			delete(m.provisionCancels, run.ID)
-			delete(m.dones, run.ID)
-			m.mu.Unlock()
-			m.admissionMu.RUnlock()
-			continue
-		}
 		m.wg.Add(1)
 		m.admissionMu.RUnlock()
 		go func(run *db.Run, repo *db.Repo, ctx context.Context, done chan struct{}) {
@@ -551,7 +545,6 @@ func (m *RunManager) resumeProvisioningRuns(runs []*db.Run) {
 					close(done)
 				}
 			}()
-			defer func() { <-m.provisionQueue }()
 			defer func() {
 				m.mu.Lock()
 				delete(m.provisionCancels, run.ID)
@@ -560,6 +553,12 @@ func (m *RunManager) resumeProvisioningRuns(runs []*db.Run) {
 				}
 				m.mu.Unlock()
 			}()
+			select {
+			case m.provisionQueue <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-m.provisionQueue }()
 			select {
 			case m.provisionSlots <- struct{}{}:
 			case <-ctx.Done():
@@ -1036,7 +1035,11 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 		}
 	}
 	if err := m.db.SetRunProvisioning(run.ID, "queued", 0, ""); err != nil {
-		return "", fmt.Errorf("record provisioning: %w", err)
+		startErr := fmt.Errorf("record provisioning: %w", err)
+		if terminalErr := m.db.UpdateRunErrorStatus(run.ID, startErr.Error(), types.RunFailed); terminalErr != nil {
+			return "", fmt.Errorf("%w; mark run failed: %v", startErr, terminalErr)
+		}
+		return "", startErr
 	}
 	select {
 	case m.provisionQueue <- struct{}{}:

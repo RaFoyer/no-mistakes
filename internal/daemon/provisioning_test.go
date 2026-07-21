@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,69 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestResumeProvisioningRunsRetainsRecoveryQueueOverflow(t *testing.T) {
+	_, d, mgr, repo, headSHA := newProvisioningTestManager(t, "provisioning-recovery-overflow")
+	mgr.provisionQueue = make(chan struct{}, 1)
+	mgr.provisionQueue <- struct{}{}
+	var runs []*db.Run
+	for range 2 {
+		run, err := d.InsertRun(repo.ID, "main", headSHA, headSHA)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := d.SetRunProvisioning(run.ID, "queued", 0, ""); err != nil {
+			t.Fatal(err)
+		}
+		runs = append(runs, run)
+	}
+
+	mgr.resumeProvisioningRuns(runs)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		mgr.mu.Lock()
+		active := len(mgr.provisionCancels)
+		mgr.mu.Unlock()
+		if active == len(runs) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mgr.mu.Lock()
+	active := len(mgr.provisionCancels)
+	mgr.mu.Unlock()
+	if active != len(runs) {
+		t.Fatalf("recovered provisioning cancels = %d, want %d", active, len(runs))
+	}
+	<-mgr.provisionQueue
+	for _, run := range runs {
+		if terminal := waitForRunTerminalState(t, d, run.ID); terminal.Status != types.RunCompleted {
+			t.Fatalf("recovered overflow run = %+v", terminal)
+		}
+	}
+}
+
+func TestStartRunTerminalizesWhenInitialProvisioningRecordFails(t *testing.T) {
+	p, d, mgr, repo, headSHA := newProvisioningTestManager(t, "provisioning-record-failure")
+	triggerDB, err := sql.Open("sqlite", p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer triggerDB.Close()
+	if _, err := triggerDB.Exec(`CREATE TRIGGER fail_provisioning BEFORE INSERT ON lifecycle_events WHEN NEW.event_type = 'provisioning' BEGIN SELECT RAISE(ABORT, 'injected provisioning failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mgr.startRun(context.Background(), repo, "main", headSHA, headSHA, "push", nil, "", nil, nil); err == nil {
+		t.Fatal("startRun unexpectedly succeeded")
+	}
+	runs, err := d.GetRunsByRepo(repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].Status != types.RunFailed || runs[0].Error == nil || !strings.Contains(*runs[0].Error, "record provisioning") {
+		t.Fatalf("initial provisioning failure projection = %+v", runs)
+	}
+}
 
 func TestPushReceivedReturnsWhileProvisioningQueued(t *testing.T) {
 	p, d, mgr, repo, headSHA := newProvisioningTestManager(t, "provisioning-queued")

@@ -24,6 +24,39 @@ func (authorizationAgent) Run(context.Context, agent.RunOpts) (*agent.Result, er
 	return nil, &agent.AuthorizationRequiredError{Agent: "codex", Detail: "account rotation"}
 }
 
+type cursorAuthorizationAgent struct{}
+
+func (cursorAuthorizationAgent) Name() string { return "cursor" }
+func (cursorAuthorizationAgent) Close() error { return nil }
+func (cursorAuthorizationAgent) Run(context.Context, agent.RunOpts) (*agent.Result, error) {
+	return nil, &agent.AuthorizationRequiredError{Agent: "cursor", Detail: "isolated profile requires login"}
+}
+
+func TestExecutorCursorAuthorizationInstructionsNameCursor(t *testing.T) {
+	database, p, run, repo := setupTest(t)
+	step := &adaptiveCallStep{name: types.StepReview, fn: func(sctx *StepContext) (*StepOutcome, error) {
+		_, err := sctx.Agent.Run(sctx.Ctx, agent.RunOpts{Prompt: "review", Purpose: "review"})
+		return nil, err
+	}}
+	exec := NewExecutor(database, p, nil, cursorAuthorizationAgent{}, []Step{step}, nil)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	t.Cleanup(func() { cancel(fmt.Errorf("test cleanup")) })
+	done := make(chan error, 1)
+	go func() { done <- exec.Execute(ctx, run, repo, t.TempDir()) }()
+	waitForAuthorizationGate(t, database, exec, run.ID, types.StepReview, 1)
+	stored, err := database.GetRun(run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.BlockedReason == nil || !strings.Contains(*stored.BlockedReason, "Cursor account") || strings.Contains(strings.ToLower(*stored.BlockedReason), "codex") {
+		t.Fatalf("authorization instructions = %v, want Cursor-specific guidance", stored.BlockedReason)
+	}
+	cancel(fmt.Errorf("daemon shutting down"))
+	if err := <-done; err != nil {
+		t.Fatalf("parked execution = %v", err)
+	}
+}
+
 type countingAuthorizationAgent struct {
 	attempts atomic.Int32
 }

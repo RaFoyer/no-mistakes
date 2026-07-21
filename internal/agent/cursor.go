@@ -200,8 +200,11 @@ func validateCursorConfigDir(path string) error {
 		if err != nil {
 			return fmt.Errorf("cursor profile metadata %q: %w", current, err)
 		}
-		if entryInfo.Mode()&os.ModeSymlink != 0 {
+		if entry.Type()&os.ModeSymlink != 0 || entryInfo.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("cursor profile contains symlink %q", current)
+		}
+		if !entryInfo.IsDir() && !entryInfo.Mode().IsRegular() {
+			return fmt.Errorf("cursor profile entry %q must be a regular file or directory", current)
 		}
 		wantMode := os.FileMode(0o600)
 		if entryInfo.IsDir() {

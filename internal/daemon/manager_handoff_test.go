@@ -2,15 +2,58 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestManagerCheckpointBoundsHeadVerification(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	repo, err := database.InsertRepo("/tmp/project", "git@example.test:project.git", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := database.InsertRun(repo.ID, "feature", "head", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatus(run.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	handoff := beginTestHandoff(t, database)
+	mgr := NewRunManager(database, p, nil)
+	if err := mgr.BeginHandoffQuiesce(handoff.ID, "generation-a"); err != nil {
+		t.Fatal(err)
+	}
+	previousTimeout, previousHeadSHA := handoffHeadVerifyTimeout, handoffHeadSHA
+	handoffHeadVerifyTimeout = 10 * time.Millisecond
+	handoffHeadSHA = func(ctx context.Context, _ string) (string, error) {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	t.Cleanup(func() {
+		handoffHeadVerifyTimeout = previousTimeout
+		handoffHeadSHA = previousHeadSHA
+	})
+	if _, err := mgr.checkpointForHandoff(pipeline.HandoffCheckpointRequest{Run: run, WorkDir: "/stuck", NextStep: types.StepTest}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("checkpoint error = %v, want bounded head verification timeout", err)
+	}
+}
 
 func TestBeginHandoffQuiesceRefusesPublicationProfileCustody(t *testing.T) {
 	p := paths.WithRoot(t.TempDir())

@@ -8,11 +8,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/routing"
 )
+
+func TestCursorConfigDirRejectsSpecialFiles(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "profile")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pipe := filepath.Join(dir, "credential-pipe")
+	if err := syscall.Mkfifo(pipe, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateCursorConfigDir(dir); err == nil || !strings.Contains(err.Error(), "regular file or directory") {
+		t.Fatalf("special profile entry error = %v, want regular-file refusal", err)
+	}
+}
 
 func writeCursorFixture(t *testing.T, body string) string {
 	t.Helper()

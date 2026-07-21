@@ -972,7 +972,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		roundDuration := time.Since(phaseStart).Milliseconds()
 		if err != nil {
 			if agent.IsAuthorizationRequired(err) {
-				if parkErr := e.parkForAuthorization(ctx, step, sctx, sr, run, repo, roundNum); parkErr == nil {
+				if parkErr := e.parkForAuthorization(ctx, step, sctx, sr, run, repo, roundNum, err); parkErr == nil {
 					phaseStart = time.Now()
 					continue
 				} else if errors.Is(parkErr, errAuthorizationParked) {
@@ -1245,10 +1245,11 @@ func roundInsertID(_ string, inserted *db.StepRound, err error) string {
 	return inserted.ID
 }
 
-func (e *Executor) parkForAuthorization(ctx context.Context, step Step, sctx *StepContext, sr *db.StepResult, run *db.Run, repo *db.Repo, round int) error {
-	reason := "codex authorization required; log into a healthy Codex account, then approve one bounded retry"
+func (e *Executor) parkForAuthorization(ctx context.Context, step Step, sctx *StepContext, sr *db.StepResult, run *db.Run, repo *db.Repo, round int, authErr error) error {
+	provider := authorizationProviderName(authErr, sctx.Agent.Name())
+	reason := fmt.Sprintf("%s authorization required; log into a healthy %s account, then approve one bounded retry", strings.ToLower(provider), provider)
 	if sctx.Fixing {
-		reason = "codex authorization required; fixer turn completion is unknown; inspect the worktree and confirm the retry is idempotent before approving one bounded retry"
+		reason = fmt.Sprintf("%s authorization required; fixer turn completion is unknown; inspect the worktree and confirm the retry is idempotent before approving one bounded retry", strings.ToLower(provider))
 	}
 	attempts, err := e.authorizationParkCount(run.ID)
 	if err != nil {
@@ -1263,7 +1264,7 @@ func (e *Executor) parkForAuthorization(ctx context.Context, step Step, sctx *St
 	}
 	run.Status = types.RunAwaitingAuth
 	run.BlockedReason = func() *string { v := reason; return &v }()
-	findings := `{"summary":"Codex authorization is required before this turn can continue","risk_level":"high","risk_rationale":"external authentication state is unavailable","findings":[]}`
+	findings := fmt.Sprintf(`{"summary":%q,"risk_level":"high","risk_rationale":"external authentication state is unavailable","findings":[]}`, provider+" authorization is required before this turn can continue")
 	if err := e.db.SetStepFindings(sr.ID, findings); err != nil {
 		return err
 	}
@@ -1306,6 +1307,18 @@ func (e *Executor) parkForAuthorization(ctx context.Context, step Step, sctx *St
 	}
 	sctx.Log(fmt.Sprintf("authentication recovered after explicit approval (%d ms parked); retrying the same agent turn", time.Since(parkStart).Milliseconds()))
 	return nil
+}
+
+func authorizationProviderName(authErr error, fallback string) string {
+	provider := strings.TrimSpace(fallback)
+	var typed *agent.AuthorizationRequiredError
+	if errors.As(authErr, &typed) && strings.TrimSpace(typed.Agent) != "" {
+		provider = strings.TrimSpace(typed.Agent)
+	}
+	if provider == "" {
+		provider = "agent"
+	}
+	return strings.ToUpper(provider[:1]) + provider[1:]
 }
 
 func (e *Executor) authorizationParkCount(runID string) (int, error) {
