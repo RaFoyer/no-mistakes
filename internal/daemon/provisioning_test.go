@@ -58,6 +58,58 @@ func TestResumeProvisioningRunsRetainsRecoveryQueueOverflow(t *testing.T) {
 	}
 }
 
+func TestCancelRecoveredProvisioningPersistsCancelledRunBeforeWorkerLaunch(t *testing.T) {
+	for _, waitAt := range []string{"queue", "slot"} {
+		t.Run(waitAt, func(t *testing.T) {
+			_, d, mgr, repo, headSHA := newProvisioningTestManager(t, "provisioning-recovered-cancel-"+waitAt)
+			run, err := d.InsertRun(repo.ID, "main", headSHA, headSHA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := d.SetRunProvisioning(run.ID, "queued", 0, ""); err != nil {
+				t.Fatal(err)
+			}
+			mgr.provisionQueue = make(chan struct{}, 1)
+			if waitAt == "queue" {
+				mgr.provisionQueue <- struct{}{}
+			} else {
+				fillProvisionSlots(t, mgr)
+			}
+
+			mgr.resumeProvisioningRuns([]*db.Run{run})
+			deadline := time.Now().Add(time.Second)
+			ready := false
+			for time.Now().Before(deadline) {
+				mgr.mu.Lock()
+				_, active := mgr.provisionCancels[run.ID]
+				mgr.mu.Unlock()
+				if active && (waitAt == "queue" || len(mgr.provisionQueue) == 1) {
+					ready = true
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if !ready {
+				t.Fatalf("recovered provisioning did not reach %s wait", waitAt)
+			}
+			if err := mgr.HandleCancel(run.ID); err != nil {
+				t.Fatal(err)
+			}
+			cancelled := waitForRunStatus(t, d, run.ID, types.RunCancelled)
+			if cancelled.Error == nil || !strings.Contains(*cancelled.Error, types.RunCancelReasonAbortedByUser) {
+				t.Fatalf("cancelled recovered run error = %v", cancelled.Error)
+			}
+			waitForManagerIdle(t, mgr, time.Second)
+			mgr.mu.Lock()
+			_, active := mgr.provisionCancels[run.ID]
+			mgr.mu.Unlock()
+			if active {
+				t.Fatal("cancelled recovered provisioning still has an active cancellation handle")
+			}
+		})
+	}
+}
+
 func TestStartRunTerminalizesWhenInitialProvisioningRecordFails(t *testing.T) {
 	p, d, mgr, repo, headSHA := newProvisioningTestManager(t, "provisioning-record-failure")
 	triggerDB, err := sql.Open("sqlite", p.DB())

@@ -539,6 +539,15 @@ func (m *RunManager) resumeProvisioningRuns(runs []*db.Run) {
 		m.admissionMu.RUnlock()
 		go func(run *db.Run, repo *db.Repo, ctx context.Context, done chan struct{}) {
 			launched := false
+			cancelProvisioning := func() {
+				cause := context.Cause(ctx)
+				if cause == nil {
+					cause = context.Canceled
+				}
+				if err := m.db.UpdateRunErrorStatus(run.ID, cause.Error(), types.RunCancelled); err != nil {
+					slog.Error("failed to persist recovered provisioning cancellation", "run_id", run.ID, "error", err)
+				}
+			}
 			defer m.wg.Done()
 			defer func() {
 				if !launched {
@@ -556,12 +565,14 @@ func (m *RunManager) resumeProvisioningRuns(runs []*db.Run) {
 			select {
 			case m.provisionQueue <- struct{}{}:
 			case <-ctx.Done():
+				cancelProvisioning()
 				return
 			}
 			defer func() { <-m.provisionQueue }()
 			select {
 			case m.provisionSlots <- struct{}{}:
 			case <-ctx.Done():
+				cancelProvisioning()
 				return
 			}
 			defer func() { <-m.provisionSlots }()
