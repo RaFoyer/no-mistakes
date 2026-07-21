@@ -182,7 +182,7 @@ No Mistakes owns routing in core and records a bounded routing generation with e
    ' "$CANARY_ROOT/route-evidence.toon"
    test -s "$CANARY_INVOCATIONS"
    ```
-   Inspect `route_decisions` for the requested/effective harness, model, effort, `policy_version`, and `configuration_generation`, and inspect `review_results` for the completed classification. Codex rows should show the No Mistakes GPT policy; non-Codex rows must leave effective model and effort empty. The output must contain no external router name or process. This is a real agent invocation inside the disposable repository, not a log-only daemon check.
+   Inspect `route_decisions` for the requested/effective harness, model, effort, `policy_version`, and `configuration_generation`, and inspect `review_results` for the completed classification. Codex rows should show the No Mistakes GPT policy, Cursor rows its verified Grok route, and other adapter rows must leave effective model and effort empty. The output must contain no external router name or process. This is a real agent invocation inside the disposable repository, not a log-only daemon check.
 5. Stop the canary explicitly and remove both temporary homes before touching the active installation:
    ```sh
    (cd "$CANARY_REPO" && HOME="$CANARY_HOME" NM_HOME="$CANARY_NM_HOME" /path/to/new/no-mistakes daemon stop) || true

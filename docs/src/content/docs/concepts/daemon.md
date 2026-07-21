@@ -94,12 +94,13 @@ after the initial review has classified the change as high risk. Each invocation
 stores its requested/effective route, policy generation, phase, reason, and
 bounded source fingerprint in the local database.
 
-If Codex reports `AuthorizationRequired`, the run is parked with an explicit
-authentication blockage instead of being mislabeled as an ordinary agent
-failure or daemon shutdown. Log into the intended Codex account, then approve
-the parked gate with `no-mistakes axi respond --action approve`. The failure and
-subsequent recovery remain in the append-only lifecycle event history; an
-unknown-completion fixer turn is never blindly replayed by crash recovery.
+If a native provider reports `AuthorizationRequired`, the run is parked with an
+explicit authentication blockage instead of being mislabeled as an ordinary
+agent failure or daemon shutdown. Restore that provider's configured account or
+profile, then approve the parked gate with `no-mistakes axi respond --action
+approve`. The failure and subsequent recovery remain in the append-only
+lifecycle event history; an unknown-completion fixer turn is never blindly
+replayed by crash recovery.
 
 Pipeline agents are prompted to keep intentional writes inside that detached worktree and avoid changing system state outside it, such as Homebrew packages, apps under `/Applications`, or global tool configuration.
 That reduces surprising machine-level side effects and macOS App Management prompts, but it is prompt steering rather than a true sandbox.

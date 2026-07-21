@@ -29,7 +29,7 @@ func TestNeutralizesGateInstructions_OnlyVerifiedHarnessesUnderOptOut(t *testing
 			t.Errorf("%s must neutralize under the opt-out with its default knob", name)
 		}
 	}
-	unverified := []types.AgentName{types.AgentOpenCode, types.AgentPi, types.AgentCopilot, types.AgentRovoDev}
+	unverified := []types.AgentName{types.AgentCursor, types.AgentOpenCode, types.AgentPi, types.AgentCopilot, types.AgentRovoDev}
 	for _, name := range unverified {
 		if NeutralizesGateInstructions(optOutAgent(t, name, nil)) {
 			t.Errorf("%s has no verified knob; must NOT report neutralized", name)
@@ -74,11 +74,11 @@ func TestEnsureGateNeutralized_RefusesUnsupportedUnderOptOut(t *testing.T) {
 	if err := EnsureGateNeutralized(optOutAgent(t, types.AgentClaude, nil)); err != nil {
 		t.Errorf("claude must pass the gate under opt-out: %v", err)
 	}
-	err := EnsureGateNeutralized(optOutAgent(t, types.AgentOpenCode, nil))
+	err := EnsureGateNeutralized(optOutAgent(t, types.AgentCursor, nil))
 	if err == nil {
-		t.Fatal("opencode must be refused by the gate under opt-out")
+		t.Fatal("cursor must be refused by the gate under opt-out")
 	}
-	if !strings.Contains(err.Error(), "does not neutralize") || !strings.Contains(err.Error(), "opencode") {
+	if !strings.Contains(err.Error(), "does not neutralize") || !strings.Contains(err.Error(), "cursor") {
 		t.Errorf("refusal error should name the harness and reason, got: %v", err)
 	}
 	if err := EnsureGateNeutralized(nil); err == nil {

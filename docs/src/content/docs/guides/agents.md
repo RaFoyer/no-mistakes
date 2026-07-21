@@ -6,7 +6,7 @@ description: Supported AI agents, how to pick one, and how they integrate.
 `no-mistakes` is pipeline-agent-agnostic by design: the gate should mean the same thing regardless of which supported agent backend you prefer.
 It is not runner-free.
 Every validation run requires either a supported native agent binary or `acpx` configured for an ACP target.
-The default `agent: auto` setting picks the first supported native agent available on your system.
+The default `agent: auto` setting picks the first auto-eligible native agent available on your system.
 
 The coding agent that calls `no-mistakes axi` drives approval gates, but it does not automatically become the pipeline agent that performs review, evidence testing, documentation, combined documentation-and-lint housekeeping, or fixes.
 Those jobs run in the daemon's disposable worktree through the configured pipeline agent.
@@ -37,15 +37,9 @@ By default that directory is temporary and local to the machine; repos can opt i
 
 ## Supported agents
 
-| Agent | Binary | Protocol |
-|---|---|---|
-| Claude | `claude` | Subprocess per invocation, JSONL streaming |
-| Codex | `codex` | Subprocess per invocation, JSONL events |
-| Rovo Dev | `acli` | Persistent HTTP server, SSE streaming |
-| OpenCode | `opencode` | Persistent HTTP server, SSE streaming |
-| Pi | `pi` | Subprocess per invocation, JSONL events |
-| Copilot | `copilot` | Subprocess per invocation, JSONL events |
-| ACP target | `acpx` | Optional user-installed ACP bridge |
+No Mistakes supports native agent CLIs and optional `acp:<target>` runners through `acpx`.
+The [global agent reference](/no-mistakes/reference/global-config/#agent) owns the exact agent names, binaries, auto-selection order, fallback behavior, and explicit-only routes.
+For the native Cursor Agent CLI's isolated profile, pinned version, model, and permission contract, see [Cursor Agent Adapter](/no-mistakes/reference/cursor-adapter/).
 
 ## Runner requirements
 
@@ -212,7 +206,7 @@ Each invocation returns:
 - **SessionID** and **Resumed** - the adapter-native session identity and whether this invocation resumed it, when supported
 - **Model** and **Provider** - adapter-reported serving metadata when available
 
-One-shot subprocess agents (Claude, Codex, Pi, Copilot CLI, and acpx) are invocation-scoped.
+One-shot subprocess agents (Claude, Codex, Cursor, Pi, Copilot CLI, and acpx) are invocation-scoped.
 After no-mistakes starts one, it terminates any remaining child processes when the invocation exits, fails, or is cancelled, so agent-spawned test workers, build watchers, and dev servers do not survive the step.
 Step logs record their process lifecycle, including start and exit lines with the PID, and AXI status exposes that PID while the subprocess is still active.
 Persistent server agents (Rovo Dev and OpenCode) use their managed server lifecycle instead.
@@ -250,7 +244,7 @@ Spawns a `codex` subprocess for each invocation with `exec --json`. When structu
 Codex model and config overrides, such as `-m gpt-5.4`, `-c service_tier="priority"`, or `-c model_reasoning_effort="low"`, belong in global `agent_args_override.codex`.
 For review-loop reuse, Codex resumes the reported thread with `codex exec resume <id> -` and reads the prompt from stdin.
 That resume command has a narrower flag surface than `codex exec`, so a resume that rejects an override falls back to a fresh same-role session rather than skipping the review turn.
-No Mistakes supplies the phase-aware policy route for each invocation: Luna/`xhigh` for initial/default work, Terra/`high` for medium/high-risk non-review work, and Sol/`high` only for a high-risk review confirmation after the initial review classification. Full prompts are transported through stdin; they are not placed in process argv. If Codex returns `AuthorizationRequired`, the run parks for explicit account recovery and approval rather than replaying an unknown-completion fixer turn.
+No Mistakes supplies the phase-aware policy route for each invocation: Luna/`xhigh` for initial/default work, Terra/`high` for medium/high-risk non-review work, and Sol/`high` only for a high-risk review confirmation after the initial review classification. Full prompts are transported through stdin; they are not placed in process argv. When a native provider returns `AuthorizationRequired`, the run parks for explicit account recovery and approval rather than replaying an unknown-completion fixer turn. Cursor's isolated-profile recovery contract is documented in [Cursor Agent Adapter](/no-mistakes/reference/cursor-adapter/).
 
 ## Rovo Dev
 
