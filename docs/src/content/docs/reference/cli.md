@@ -269,6 +269,16 @@ no-mistakes runs [--limit <n>]
 
 Shows runs newest-first with branch, status (styled), short SHA, timestamp, and PR URL if set.
 
+## no-mistakes coordinator status
+
+Show read-only shared-runtime admission correlation evidence for the current repository.
+
+```sh
+no-mistakes coordinator status
+```
+
+The source build ships no coordinator endpoint, credentials, deployment, or recovery action, so this command always labels the external coordinator inactive. Any listed rows are local correlation evidence for a coordinator-issued claim and hash-linked ledger entry; they are not a ledger, lease, lock, or authority to reopen admission or recover a runtime.
+
 ## no-mistakes stats
 
 Show historical usage stats across all repos.

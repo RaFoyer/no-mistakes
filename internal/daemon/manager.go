@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/admission"
 	"github.com/kunchenguid/no-mistakes/internal/agent"
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/db"
@@ -42,6 +45,9 @@ type RunManager struct {
 	db           *db.DB
 	paths        *paths.Paths
 	steps        StepFactory
+	admission    admission.RuntimeCoordinator
+	runtimeScope string
+	claimant     admission.Claimant
 
 	branchLocks sync.Map // repoID+"/"+branch → *sync.Mutex
 
@@ -51,12 +57,56 @@ type RunManager struct {
 	completedOrder []string                      // insertion order for FIFO eviction
 }
 
+// RunManagerOption changes one dependency of a manager. Production callers do
+// not provide an admission coordinator, so new starts remain fail-closed until
+// an independently operated coordinator adapter is deliberately installed.
+type RunManagerOption func(*RunManager)
+
+// WithAdmissionCoordinator injects a coordinator. It exists for the future
+// external adapter and deterministic local test doubles only; this package
+// never constructs a local production authority.
+func WithAdmissionCoordinator(c admission.RuntimeCoordinator) RunManagerOption {
+	return func(m *RunManager) {
+		if c != nil {
+			m.admission = c
+		}
+	}
+}
+
+// WithAdmissionIdentity overrides the portable runtime scope and claimant for
+// an external adapter. The defaults intentionally contain neither paths nor
+// local account identifiers.
+func WithAdmissionIdentity(runtimeScope string, claimant admission.Claimant) RunManagerOption {
+	return func(m *RunManager) {
+		if strings.TrimSpace(runtimeScope) != "" {
+			m.runtimeScope = runtimeScope
+		}
+		if claimant.Valid() {
+			m.claimant = claimant
+		}
+	}
+}
+
+func defaultRuntimeScope(p *paths.Paths) string {
+	// The root is only a stable discriminator for one runtime; its digest is
+	// not authority, ledger state, a reusable lease, or a portable path.
+	root := p.Root()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	if absolute, err := filepath.Abs(root); err == nil {
+		root = absolute
+	}
+	digest := sha256.Sum256([]byte("no-mistakes.runtime.v1\x00" + root))
+	return "no-mistakes/runtime/v1/" + hex.EncodeToString(digest[:])
+}
+
 // NewRunManager creates a RunManager. Pass nil for stepFactory to use default steps.
-func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *RunManager {
+func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory, options ...RunManagerOption) *RunManager {
 	if stepFactory == nil {
 		stepFactory = func() []pipeline.Step { return steps.AllSteps() }
 	}
-	return &RunManager{
+	m := &RunManager{
 		executors:     make(map[string]*pipeline.Executor),
 		cancels:       make(map[string]context.CancelCauseFunc),
 		dones:         make(map[string]chan struct{}),
@@ -65,7 +115,14 @@ func NewRunManager(database *db.DB, p *paths.Paths, stepFactory StepFactory) *Ru
 		steps:         stepFactory,
 		subscribers:   make(map[string][]chan<- ipc.Event),
 		completedRuns: make(map[string]bool),
+		admission:     newDefaultAdmissionCoordinator(),
+		runtimeScope:  defaultRuntimeScope(p),
+		claimant:      admission.Claimant{Kind: "no-mistakes-daemon", ID: "unconfigured"},
 	}
+	for _, option := range options {
+		option(m)
+	}
+	return m
 }
 
 type recoveredRunPlan struct {
@@ -587,6 +644,55 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch string, ski
 	return m.startRun(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent)
 }
 
+func (m *RunManager) currentAdmissionSnapshot() (admission.Snapshot, error) {
+	runs, err := m.db.GetActiveRuns()
+	if err != nil {
+		return admission.Snapshot{}, fmt.Errorf("list active runs for admission: %w", err)
+	}
+	active := make([]admission.ActiveRun, 0, len(runs))
+	for _, run := range runs {
+		active = append(active, admission.ActiveRun{
+			ID: run.ID, RepoID: run.RepoID, Branch: run.Branch, HeadSHA: run.HeadSHA, Status: string(run.Status),
+		})
+	}
+	return admission.NewSnapshot(m.runtimeScope, active), nil
+}
+
+// acquireStartAdmission closes shared-runtime admission and performs the
+// immediate pre-action active-set compare-and-swap. It is deliberately called
+// before cancelActiveRuns, InsertRun, WorktreeAdd, or any other start-side
+// mutation. A coordinator failure therefore cannot disturb an existing run.
+func (m *RunManager) acquireStartAdmission(ctx context.Context) (admission.Lease, error) {
+	snapshot, err := m.currentAdmissionSnapshot()
+	if err != nil {
+		return admission.Lease{}, err
+	}
+	claim, err := m.admission.Acquire(ctx, admission.Request{
+		Runtime: m.runtimeScope, Claimant: m.claimant, Snapshot: snapshot,
+	})
+	if err != nil {
+		return admission.Lease{}, fmt.Errorf("acquire shared-runtime admission: %w", err)
+	}
+	lease, err := m.admission.Prepare(ctx, claim, snapshot)
+	if err != nil {
+		return admission.Lease{}, fmt.Errorf("prepare shared-runtime admission: %w", err)
+	}
+	current, snapshotErr := m.currentAdmissionSnapshot()
+	if snapshotErr != nil {
+		if abortErr := m.admission.Abort(context.Background(), lease, "cannot reread active set before start"); abortErr != nil {
+			slog.Error("failed to abort prepared admission after active-set read failure", "claim_id", lease.ClaimID, "error", abortErr)
+		}
+		return admission.Lease{}, snapshotErr
+	}
+	if err := m.admission.Start(ctx, lease, current); err != nil {
+		if abortErr := m.admission.Abort(context.Background(), lease, "pre-action compare-and-swap rejected"); abortErr != nil {
+			slog.Error("failed to abort prepared admission after compare-and-swap rejection", "claim_id", lease.ClaimID, "error", abortErr)
+		}
+		return admission.Lease{}, fmt.Errorf("start shared-runtime admission: %w", err)
+	}
+	return lease, nil
+}
+
 // startRun creates a run, sets up a worktree, and launches pipeline execution.
 // A non-empty intent is stamped onto the run as agent-supplied, so the intent
 // step uses it instead of inferring from transcripts.
@@ -614,6 +720,32 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 	branchMu.Lock()
 	defer branchMu.Unlock()
 
+	lease, err := m.acquireStartAdmission(ctx)
+	if err != nil {
+		trackStartFailure("admission")
+		return "", err
+	}
+	// A terminal admission transition is exactly once. On an ambiguous terminal
+	// transport failure we never try another transition, because the first
+	// request might already have reopened admission remotely.
+	admissionTerminalAttempted := false
+	admissionReceiptRunID := ""
+	defer func() {
+		if admissionTerminalAttempted {
+			return
+		}
+		// Failure to record the terminal transition must leave admission closed
+		// rather than guessing that a new start is safe. The coordinator ledger,
+		// not this process, owns reopening.
+		if failErr := m.admission.Fail(context.Background(), lease, "run start setup failed"); failErr != nil {
+			slog.Error("failed to terminalize shared-runtime admission", "claim_id", lease.ClaimID, "error", failErr)
+		} else if admissionReceiptRunID != "" {
+			if receiptErr := m.db.UpdateAdmissionReceiptTerminal(admissionReceiptRunID, "failed"); receiptErr != nil {
+				slog.Error("failed to update local admission receipt", "run_id", admissionReceiptRunID, "error", receiptErr)
+			}
+		}
+	}()
+
 	// Cancel any active run for this repo+branch.
 	m.cancelActiveRuns(repo.ID, branch)
 
@@ -623,6 +755,25 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 		trackStartFailure("create_run")
 		return "", fmt.Errorf("create run: %w", err)
 	}
+	// This is local correlation evidence only, recorded after the external
+	// coordinator has atomically reached started. It cannot be used as a lease
+	// or a recovery authority if it is missing, stale, or tampered with.
+	if err := m.db.InsertAdmissionReceipt(db.AdmissionReceipt{
+		RunID:        run.ID,
+		Runtime:      lease.Runtime,
+		ClaimID:      lease.ClaimID,
+		LeaseID:      lease.LeaseID,
+		Generation:   lease.Generation,
+		SnapshotHash: lease.SnapshotHash,
+		LedgerSeq:    lease.LedgerSeq,
+		LedgerHash:   lease.LedgerHash,
+		State:        "started",
+	}); err != nil {
+		m.db.UpdateRunError(run.ID, fmt.Sprintf("record admission receipt: %s", err))
+		trackStartFailure("record_admission_receipt")
+		return "", fmt.Errorf("record admission receipt: %w", err)
+	}
+	admissionReceiptRunID = run.ID
 
 	// Stamp an agent-supplied intent onto the run before the pipeline starts,
 	// so the intent step finds it already present and skips transcript-based
@@ -832,6 +983,27 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 					slog.Error("failed to update run after panic", "run_id", run.ID, "error", dbErr)
 				}
 			}
+			// Admission remains closed until the run reaches its terminal state.
+			// Returning from startRun or launching this goroutine is never a
+			// terminal event: reopening earlier would permit a competing start to
+			// cancel or mutate an active run outside the coordinator's lease.
+			terminalize := m.admission.Fail
+			receiptState := "failed"
+			evidence := "run ended without completed status"
+			if run.Status == types.RunCompleted {
+				terminalize = m.admission.Complete
+				receiptState = "completed"
+				evidence = "run completed"
+			} else if run.Error != nil && *run.Error != "" {
+				evidence = *run.Error
+			}
+			if admissionErr := terminalize(context.Background(), lease, evidence); admissionErr != nil {
+				// Fail closed: only the coordinator can determine whether a
+				// terminal transition safely reopened the shared runtime.
+				slog.Error("failed to terminalize shared-runtime admission", "claim_id", lease.ClaimID, "error", admissionErr)
+			} else if receiptErr := m.db.UpdateAdmissionReceiptTerminal(run.ID, receiptState); receiptErr != nil {
+				slog.Error("failed to update local admission receipt", "run_id", run.ID, "error", receiptErr)
+			}
 			cancel(nil)
 			ag.Close()
 			// Close subscriber channels for this run.
@@ -882,6 +1054,8 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 		}
 	}()
 
+	// The pipeline goroutine now owns the terminal coordinator transition.
+	admissionTerminalAttempted = true
 	return run.ID, nil
 }
 

@@ -109,13 +109,13 @@ func initLogger(level string) {
 
 // RunWithResources starts the daemon with pre-initialized paths and DB.
 // Useful for testing where the caller controls resource setup.
-func RunWithResources(p *paths.Paths, d *db.DB) error {
-	return RunWithOptions(p, d, nil)
+func RunWithResources(p *paths.Paths, d *db.DB, options ...RunManagerOption) error {
+	return RunWithOptions(p, d, nil, options...)
 }
 
 // RunWithOptions starts the daemon with optional overrides.
 // stepFactory overrides the default pipeline steps (for testing).
-func RunWithOptions(p *paths.Paths, d *db.DB, stepFactory StepFactory) error {
+func RunWithOptions(p *paths.Paths, d *db.DB, stepFactory StepFactory, options ...RunManagerOption) error {
 	// Singleton guard: only one live daemon may own this NM_HOME at a time.
 	// This must be acquired before recoverOnStartup (global stale-run
 	// recovery and orphan-worktree cleanup) and before the IPC socket is
@@ -142,7 +142,7 @@ func RunWithOptions(p *paths.Paths, d *db.DB, stepFactory StepFactory) error {
 	agent.SetServerPIDsDir(p.ServerPIDsDir())
 	defer agent.SetServerPIDsDir("")
 
-	mgr := NewRunManager(d, p, stepFactory)
+	mgr := NewRunManager(d, p, stepFactory, options...)
 
 	// Recover stale runs from a previous daemon crash.
 	recoverOnStartup(d, p, mgr)

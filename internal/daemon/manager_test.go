@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kunchenguid/no-mistakes/internal/git"
+	"github.com/kunchenguid/no-mistakes/internal/admission"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/telemetry"
@@ -130,8 +129,8 @@ func TestPushReceivedSkipStepsConfiguresExecutor(t *testing.T) {
 	}
 }
 
-func TestPushReceivedAllowsDifferentBranchRunsConcurrently(t *testing.T) {
-	started := make(chan string, 2)
+func TestPushReceivedRejectsDifferentBranchRunWhileAdmissionIsClosed(t *testing.T) {
+	started := make(chan string, 1)
 	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
 		return []pipeline.Step{&notifyBlockStep{name: types.StepReview, started: started}}
 	})
@@ -156,36 +155,22 @@ func TestPushReceivedAllowsDifferentBranchRunsConcurrently(t *testing.T) {
 	waitForStartedBranch(t, started, "feature/one")
 
 	var second ipc.PushReceivedResult
-	if err := client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
+	err = client.Call(ipc.MethodPushReceived, &ipc.PushReceivedParams{
 		Gate: p.RepoDir("concurrent-branch-repo"),
 		Ref:  "refs/heads/feature/two",
 		Old:  "0000000000000000000000000000000000000000",
 		New:  headSHA,
-	}, &second); err != nil {
-		t.Fatal(err)
+	}, &second)
+	if err == nil || !strings.Contains(err.Error(), admission.ErrAdmissionClosed.Error()) {
+		t.Fatalf("second start error = %v, want closed admission", err)
 	}
-	waitForStartedBranch(t, started, "feature/two")
-
-	for _, tc := range []struct {
-		branch string
-		runID  string
-	}{
-		{branch: "feature/one", runID: first.RunID},
-		{branch: "feature/two", runID: second.RunID},
-	} {
-		active, err := d.GetActiveRun("concurrent-branch-repo", tc.branch)
-		if err != nil {
-			t.Fatalf("get active run for %s: %v", tc.branch, err)
-		}
-		if active == nil {
-			t.Fatalf("expected active run for %s", tc.branch)
-		}
-		if active.ID != tc.runID {
-			t.Fatalf("active run for %s = %s, want %s", tc.branch, active.ID, tc.runID)
-		}
-		if active.Status != types.RunRunning {
-			t.Fatalf("active run for %s status = %s, want running", tc.branch, active.Status)
-		}
+	active, err := d.GetActiveRun("concurrent-branch-repo", "feature/one")
+	if err != nil || active == nil || active.ID != first.RunID || active.Status != types.RunRunning {
+		t.Fatalf("first run = %#v, err = %v", active, err)
+	}
+	secondActive, err := d.GetActiveRun("concurrent-branch-repo", "feature/two")
+	if err != nil || secondActive != nil {
+		t.Fatalf("second run = %#v, err = %v; admission failure must not create it", secondActive, err)
 	}
 }
 
@@ -220,31 +205,14 @@ func waitForStartedBranch(t *testing.T, started <-chan string, branch string) {
 	}
 }
 
-// TestPushReceivedConcurrentDifferentBranchRunsAvoidSharedConfigLock fires two
-// branch pushes for the same repo at the same time so both runs hit worktree
-// creation and git-identity setup concurrently. All runs share one gate bare
-// repo, so writing identity with `git config --local` (which targets the bare's
-// shared config) made the two startups race on <bare>/config.lock and fail one
-// run with "could not lock config file ...: File exists". CopyLocalUserIdentity
-// now writes per-worktree, so the startups no longer contend. The race window
-// is during synchronous startRun, so a failure surfaces directly as the
-// push_received call's error. macOS-only in practice (Linux file locking and
-// timing hide it), but the assertion is platform-independent.
-func TestPushReceivedConcurrentDifferentBranchRunsAvoidSharedConfigLock(t *testing.T) {
-	started := make(chan string, 2)
+func TestPushReceivedConcurrentDifferentBranchStartsHaveOneAdmissionWinner(t *testing.T) {
+	started := make(chan string, 1)
 	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
 		return []pipeline.Step{&notifyBlockStep{name: types.StepReview, started: started}}
 	})
 
 	const repoID = "concurrent-config-lock-repo"
 	_, headSHA := setupTestGitRepo(t, p, d, repoID)
-
-	// Mirror a real gate: enable the per-worktree config isolation that
-	// `no-mistakes init` installs, which is what lets identity writes avoid the
-	// shared config.lock.
-	if err := git.IsolateHooksPath(context.Background(), p.RepoDir(repoID)); err != nil {
-		t.Fatalf("isolate hooks path: %v", err)
-	}
 
 	branches := []string{"feature/one", "feature/two"}
 	errs := make([]error, len(branches))
@@ -272,38 +240,30 @@ func TestPushReceivedConcurrentDifferentBranchRunsAvoidSharedConfigLock(t *testi
 	}
 	wg.Wait()
 
+	successes := 0
 	for i, br := range branches {
-		if errs[i] != nil {
-			t.Fatalf("concurrent push for %s failed: %v", br, errs[i])
+		if errs[i] == nil {
+			successes++
+			continue
+		}
+		if !strings.Contains(errs[i].Error(), admission.ErrAdmissionClosed.Error()) {
+			t.Fatalf("concurrent push for %s error = %v, want closed admission", br, errs[i])
 		}
 	}
-
-	// Drain both start signals regardless of which run won the race to begin,
-	// then confirm both branches have a live, error-free run.
-	gotStarted := make(map[string]bool, len(branches))
-	for range branches {
-		select {
-		case b := <-started:
-			gotStarted[b] = true
-		case <-time.After(3 * time.Second):
-			t.Fatalf("a concurrent run did not start (started so far: %v)", gotStarted)
-		}
+	if successes != 1 {
+		t.Fatalf("successful admissions = %d, want 1; errors = %v", successes, errs)
 	}
-
-	for _, br := range branches {
-		if !gotStarted[br] {
-			t.Fatalf("run for branch %s did not start", br)
-		}
-		active, err := d.GetActiveRun(repoID, br)
-		if err != nil {
-			t.Fatalf("get active run for %s: %v", br, err)
-		}
-		if active == nil {
-			t.Fatalf("expected active run for %s", br)
-		}
-		if active.Status != types.RunRunning {
-			t.Fatalf("active run for %s status = %s, want running (error: %v)", br, active.Status, active.Error)
-		}
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("admission winner did not start")
+	}
+	activeRuns, err := d.GetActiveRuns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(activeRuns) != 1 || activeRuns[0].Status != types.RunRunning {
+		t.Fatalf("active runs = %#v", activeRuns)
 	}
 }
 

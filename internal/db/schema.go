@@ -118,6 +118,25 @@ CREATE TABLE IF NOT EXISTS intent_cache (
     session_id  TEXT NOT NULL,
     created_at  INTEGER NOT NULL
 );
+
+-- Local correlation only. The external coordinator's hash-linked ledger is
+-- authoritative; this table must never be read as a runtime lease or lock.
+CREATE TABLE IF NOT EXISTS admission_receipts (
+    run_id        TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    runtime       TEXT NOT NULL,
+    claim_id      TEXT NOT NULL,
+    lease_id      TEXT NOT NULL,
+    generation    INTEGER NOT NULL,
+    snapshot_hash TEXT NOT NULL,
+    ledger_seq    INTEGER NOT NULL,
+    ledger_hash   TEXT NOT NULL,
+    state         TEXT NOT NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_admission_receipts_runtime_created
+    ON admission_receipts (runtime, created_at DESC);
 `
 
 // migrationStatements hold additive schema changes applied to databases that
