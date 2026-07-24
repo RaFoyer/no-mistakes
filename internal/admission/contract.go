@@ -132,15 +132,15 @@ func (c Claimant) Valid() bool {
 // ClaimInput is the signed, portable admission packet. PreviousHash binds a
 // fresh claim to the coordinator ledger tip observed by its issuer.
 type ClaimInput struct {
-	Version        int       `json:"version"`
-	ClaimID        string    `json:"claim_id"`
-	Runtime        string    `json:"runtime"`
-	Claimant       Claimant  `json:"claimant"`
-	SnapshotDigest string    `json:"snapshot_digest"`
-	PreviousHash   string    `json:"previous_hash"`
-	IssuedAt       time.Time `json:"issued_at"`
-	StartBy        time.Time `json:"start_by"`
-	ExpiresAt      time.Time `json:"expires_at"`
+	Version        int           `json:"version"`
+	ClaimID        string        `json:"claim_id"`
+	Runtime        string        `json:"runtime"`
+	Claimant       Claimant      `json:"claimant"`
+	SnapshotDigest string        `json:"snapshot_digest"`
+	PreviousHash   string        `json:"previous_hash"`
+	IssuedAt       time.Time     `json:"issued_at"`
+	StartBy        time.Time     `json:"start_by"`
+	ExpiresAt      time.Time     `json:"expires_at"`
 	Supersession   *Supersession `json:"supersession,omitempty"`
 }
 
