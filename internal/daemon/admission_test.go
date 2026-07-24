@@ -33,6 +33,71 @@ func TestAdmissionCallsHaveBoundedContexts(t *testing.T) {
 	}
 }
 
+type malformedLeaseCoordinator struct {
+	admission.RuntimeCoordinator
+	startCalled bool
+}
+
+func (c *malformedLeaseCoordinator) Acquire(_ context.Context, request admission.Request) (admission.Claim, error) {
+	return admission.Claim{Input: admission.ClaimInput{
+		ClaimID: "claim", Runtime: request.Runtime, Claimant: request.Claimant, SnapshotDigest: request.Snapshot.Digest,
+	}}, nil
+}
+
+func (c *malformedLeaseCoordinator) Prepare(_ context.Context, claim admission.Claim, snapshot admission.Snapshot) (admission.Lease, error) {
+	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	return admission.Lease{
+		ClaimID: claim.Input.ClaimID, LeaseID: "lease", Runtime: snapshot.Runtime, Claimant: claim.Input.Claimant,
+		SnapshotHash: snapshot.Digest, IssuedAt: now, StartBy: now.Add(time.Minute), ExpiresAt: now.Add(2 * time.Minute),
+		LedgerSeq: 1, LedgerHash: "ledger",
+	}, nil
+}
+
+func (c *malformedLeaseCoordinator) Start(context.Context, admission.Lease, admission.Snapshot) error {
+	c.startCalled = true
+	return nil
+}
+
+func TestStartRunRejectsMalformedLeaseBeforeLocalMutation(t *testing.T) {
+	p := paths.WithRoot(t.TempDir())
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := db.Open(p.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	repo, err := d.InsertRepo(t.TempDir(), "https://example.invalid/repo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing, err := d.InsertRun(repo.ID, "feature/current", "old-head", "base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.UpdateRunStatus(existing.ID, types.RunRunning); err != nil {
+		t.Fatal(err)
+	}
+	coordinator := &malformedLeaseCoordinator{RuntimeCoordinator: admission.NewInactive()}
+	mgr := NewRunManager(d, p, func() []pipeline.Step { return nil }, WithAdmissionCoordinator(coordinator))
+
+	_, err = mgr.startRun(context.Background(), repo, "feature/current", "new-head", "base", "test", nil, "")
+	if !errors.Is(err, admission.ErrInvalidLease) {
+		t.Fatalf("start error = %v, want %v", err, admission.ErrInvalidLease)
+	}
+	if coordinator.startCalled {
+		t.Fatal("malformed lease reached coordinator start")
+	}
+	runs, err := d.GetRunsByRepo(repo.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].ID != existing.ID || runs[0].Status != types.RunRunning {
+		t.Fatalf("malformed lease mutated runs: %#v", runs)
+	}
+}
+
 func TestStartRunUnavailableAdmissionPreventsCancellationAndRunInsert(t *testing.T) {
 	p := paths.WithRoot(t.TempDir())
 	if err := p.EnsureDirs(); err != nil {

@@ -667,6 +667,14 @@ func runAdmissionCall(parent context.Context, call func(context.Context) error) 
 	return call(ctx)
 }
 
+func (m *RunManager) abortPreparedAdmission(lease admission.Lease, evidence string) {
+	if err := runAdmissionCall(context.Background(), func(ctx context.Context) error {
+		return m.admission.Abort(ctx, lease, evidence)
+	}); err != nil {
+		slog.Error("failed to abort prepared admission", "claim_id", lease.ClaimID, "error", err)
+	}
+}
+
 // acquireStartAdmission closes shared-runtime admission and performs the
 // immediate pre-action active-set compare-and-swap. It is deliberately called
 // before cancelActiveRuns, InsertRun, WorktreeAdd, or any other start-side
@@ -676,12 +684,11 @@ func (m *RunManager) acquireStartAdmission(ctx context.Context) (admission.Lease
 	if err != nil {
 		return admission.Lease{}, err
 	}
+	request := admission.Request{Runtime: m.runtimeScope, Claimant: m.claimant, Snapshot: snapshot}
 	var claim admission.Claim
 	err = runAdmissionCall(ctx, func(callCtx context.Context) error {
 		var acquireErr error
-		claim, acquireErr = m.admission.Acquire(callCtx, admission.Request{
-			Runtime: m.runtimeScope, Claimant: m.claimant, Snapshot: snapshot,
-		})
+		claim, acquireErr = m.admission.Acquire(callCtx, request)
 		return acquireErr
 	})
 	if err != nil {
@@ -696,24 +703,20 @@ func (m *RunManager) acquireStartAdmission(ctx context.Context) (admission.Lease
 	if err != nil {
 		return admission.Lease{}, fmt.Errorf("prepare shared-runtime admission: %w", err)
 	}
+	if err := lease.ValidateFor(claim, request); err != nil {
+		m.abortPreparedAdmission(lease, "invalid prepared lease")
+		return admission.Lease{}, fmt.Errorf("validate shared-runtime lease: %w", err)
+	}
 	current, snapshotErr := m.currentAdmissionSnapshot()
 	if snapshotErr != nil {
-		if abortErr := runAdmissionCall(context.Background(), func(callCtx context.Context) error {
-			return m.admission.Abort(callCtx, lease, "cannot reread active set before start")
-		}); abortErr != nil {
-			slog.Error("failed to abort prepared admission after active-set read failure", "claim_id", lease.ClaimID, "error", abortErr)
-		}
+		m.abortPreparedAdmission(lease, "cannot reread active set before start")
 		return admission.Lease{}, snapshotErr
 	}
 	err = runAdmissionCall(ctx, func(callCtx context.Context) error {
 		return m.admission.Start(callCtx, lease, current)
 	})
 	if err != nil {
-		if abortErr := runAdmissionCall(context.Background(), func(callCtx context.Context) error {
-			return m.admission.Abort(callCtx, lease, "pre-action compare-and-swap rejected")
-		}); abortErr != nil {
-			slog.Error("failed to abort prepared admission after compare-and-swap rejection", "claim_id", lease.ClaimID, "error", abortErr)
-		}
+		m.abortPreparedAdmission(lease, "pre-action compare-and-swap rejected")
 		return admission.Lease{}, fmt.Errorf("start shared-runtime admission: %w", err)
 	}
 	return lease, nil

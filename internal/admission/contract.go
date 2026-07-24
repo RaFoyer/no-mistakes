@@ -30,6 +30,7 @@ var (
 	ErrDelayedStart           = errors.New("claim start window elapsed")
 	ErrInvalidTransition      = errors.New("invalid admission transition")
 	ErrUnknownLease           = errors.New("unknown admission lease")
+	ErrInvalidLease           = errors.New("invalid admission lease")
 )
 
 // ActiveRun is the exact portable representation of an active local run.
@@ -213,7 +214,18 @@ type Lease struct {
 }
 
 func (l Lease) Immutable() bool {
-	return l.ClaimID != "" && l.LeaseID != "" && l.Runtime != "" && l.Claimant.Valid() && l.SnapshotHash != "" && !l.IssuedAt.IsZero() && l.StartBy.After(l.IssuedAt) && l.ExpiresAt.After(l.StartBy) && l.LedgerSeq > 0 && l.LedgerHash != ""
+	return l.ClaimID != "" && l.LeaseID != "" && l.Runtime != "" && l.Claimant.Valid() && l.SnapshotHash != "" && l.Generation > 0 && !l.IssuedAt.IsZero() && l.StartBy.After(l.IssuedAt) && l.ExpiresAt.After(l.StartBy) && l.LedgerSeq > 0 && l.LedgerHash != ""
+}
+
+func (l Lease) ValidateFor(claim Claim, request Request) error {
+	if !l.Immutable() || request.Runtime == "" || !request.Claimant.Valid() || request.Snapshot.Validate() != nil || request.Snapshot.Runtime != request.Runtime {
+		return ErrInvalidLease
+	}
+	input := claim.Input
+	if input.ClaimID != l.ClaimID || input.Runtime != request.Runtime || input.Runtime != l.Runtime || input.Claimant != request.Claimant || input.Claimant != l.Claimant || input.SnapshotDigest != request.Snapshot.Digest || input.SnapshotDigest != l.SnapshotHash || !input.IssuedAt.Equal(l.IssuedAt) || !input.StartBy.Equal(l.StartBy) || !input.ExpiresAt.Equal(l.ExpiresAt) {
+		return ErrInvalidLease
+	}
+	return nil
 }
 
 type LedgerEntry struct {

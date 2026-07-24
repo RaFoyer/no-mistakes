@@ -207,6 +207,47 @@ func TestInMemoryCoordinatorRejectsDelayedStartAndInactiveFailsClosed(t *testing
 	}
 }
 
+func TestLeaseValidateForBindsClaimAndRequest(t *testing.T) {
+	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	coordinator, err := NewInMemory(InMemoryConfig{
+		PrivateKey: testSigningKey(), Clock: func() time.Time { return now }, NextID: deterministicIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{Runtime: testSnapshot().Runtime, Claimant: testClaimant, Snapshot: testSnapshot()}
+	claim, err := coordinator.Acquire(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := coordinator.Prepare(context.Background(), claim, request.Snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.ValidateFor(claim, request); err != nil {
+		t.Fatalf("validate lease: %v", err)
+	}
+
+	tests := []struct {
+		name  string
+		claim Claim
+		lease Lease
+	}{
+		{name: "missing generation", claim: claim, lease: func() Lease { l := lease; l.Generation = 0; return l }()},
+		{name: "different claim", claim: claim, lease: func() Lease { l := lease; l.ClaimID = "other-claim"; return l }()},
+		{name: "different runtime", claim: claim, lease: func() Lease { l := lease; l.Runtime = "other-runtime"; return l }()},
+		{name: "different snapshot", claim: claim, lease: func() Lease { l := lease; l.SnapshotHash = "other-snapshot"; return l }()},
+		{name: "extended lease", claim: claim, lease: func() Lease { l := lease; l.ExpiresAt = l.ExpiresAt.Add(time.Minute); return l }()},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.lease.ValidateFor(test.claim, request); !errors.Is(err, ErrInvalidLease) {
+				t.Fatalf("validate malformed lease error = %v, want %v", err, ErrInvalidLease)
+			}
+		})
+	}
+}
+
 func TestInMemoryCoordinatorRejectsStaleClaimAfterLedgerAdvances(t *testing.T) {
 	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
 	coordinator, err := NewInMemory(InMemoryConfig{
