@@ -27,6 +27,7 @@ var (
 	ErrClaimReplay            = errors.New("claim has already been used")
 	ErrLedgerConflict         = errors.New("claim predecessor does not match ledger tip")
 	ErrActiveSetChanged       = errors.New("active set changed before start")
+	ErrSupersessionScope      = errors.New("supersession target does not match the active set")
 	ErrDelayedStart           = errors.New("claim start window elapsed")
 	ErrInvalidTransition      = errors.New("invalid admission transition")
 	ErrUnknownLease           = errors.New("unknown admission lease")
@@ -42,6 +43,24 @@ type ActiveRun struct {
 	Branch  string `json:"branch"`
 	HeadSHA string `json:"head_sha"`
 	Status  string `json:"status"`
+}
+
+// Supersession identifies the one exact active run that a newer claim may
+// replace. It is carried in the signed claim, so a caller cannot broaden a
+// same-branch cancellation after admission has been granted.
+type Supersession struct {
+	Target ActiveRun `json:"target"`
+}
+
+func (s Supersession) valid() bool {
+	return s.Target.ID != "" && s.Target.RepoID != "" && s.Target.Branch != "" && s.Target.HeadSHA != "" && s.Target.Status != ""
+}
+
+func (s Supersession) validate(snapshot Snapshot) error {
+	if !s.valid() || len(snapshot.Runs) != 1 || snapshot.Runs[0] != s.Target {
+		return ErrSupersessionScope
+	}
+	return nil
 }
 
 // Snapshot binds a runtime scope to a canonical, exact active-run set.
@@ -122,6 +141,7 @@ type ClaimInput struct {
 	IssuedAt       time.Time `json:"issued_at"`
 	StartBy        time.Time `json:"start_by"`
 	ExpiresAt      time.Time `json:"expires_at"`
+	Supersession   *Supersession `json:"supersession,omitempty"`
 }
 
 // Claim is mutable only as an untrusted transport value: every use verifies
@@ -175,16 +195,21 @@ func normalizeClaimInput(input ClaimInput) (ClaimInput, error) {
 	input.IssuedAt = input.IssuedAt.UTC()
 	input.StartBy = input.StartBy.UTC()
 	input.ExpiresAt = input.ExpiresAt.UTC()
-	if input.Version != 1 || strings.TrimSpace(input.ClaimID) == "" || strings.TrimSpace(input.Runtime) == "" || !input.Claimant.Valid() || strings.TrimSpace(input.SnapshotDigest) == "" || input.IssuedAt.IsZero() || input.StartBy.IsZero() || input.ExpiresAt.IsZero() || !input.StartBy.After(input.IssuedAt) || !input.ExpiresAt.After(input.StartBy) {
+	if input.Version != 1 || strings.TrimSpace(input.ClaimID) == "" || strings.TrimSpace(input.Runtime) == "" || !input.Claimant.Valid() || strings.TrimSpace(input.SnapshotDigest) == "" || input.IssuedAt.IsZero() || input.StartBy.IsZero() || input.ExpiresAt.IsZero() || !input.StartBy.After(input.IssuedAt) || !input.ExpiresAt.After(input.StartBy) || (input.Supersession != nil && !input.Supersession.valid()) {
 		return ClaimInput{}, fmt.Errorf("incomplete claim packet")
+	}
+	if input.Supersession != nil {
+		supersession := *input.Supersession
+		input.Supersession = &supersession
 	}
 	return input, nil
 }
 
 type Request struct {
-	Runtime  string
-	Claimant Claimant
-	Snapshot Snapshot
+	Runtime      string
+	Claimant     Claimant
+	Snapshot     Snapshot
+	Supersession *Supersession
 }
 
 type State string
@@ -211,21 +236,32 @@ type Lease struct {
 	ExpiresAt    time.Time
 	LedgerSeq    uint64
 	LedgerHash   string
+	Supersession *Supersession
 }
 
 func (l Lease) Immutable() bool {
-	return l.ClaimID != "" && l.LeaseID != "" && l.Runtime != "" && l.Claimant.Valid() && l.SnapshotHash != "" && l.Generation > 0 && !l.IssuedAt.IsZero() && l.StartBy.After(l.IssuedAt) && l.ExpiresAt.After(l.StartBy) && l.LedgerSeq > 0 && l.LedgerHash != ""
+	return l.ClaimID != "" && l.LeaseID != "" && l.Runtime != "" && l.Claimant.Valid() && l.SnapshotHash != "" && l.Generation > 0 && !l.IssuedAt.IsZero() && l.StartBy.After(l.IssuedAt) && l.ExpiresAt.After(l.StartBy) && l.LedgerSeq > 0 && l.LedgerHash != "" && (l.Supersession == nil || l.Supersession.valid())
 }
 
 func (l Lease) ValidateFor(claim Claim, request Request) error {
 	if !l.Immutable() || request.Runtime == "" || !request.Claimant.Valid() || request.Snapshot.Validate() != nil || request.Snapshot.Runtime != request.Runtime {
 		return ErrInvalidLease
 	}
+	if request.Supersession != nil && request.Supersession.validate(request.Snapshot) != nil {
+		return ErrInvalidLease
+	}
 	input := claim.Input
-	if input.ClaimID != l.ClaimID || input.Runtime != request.Runtime || input.Runtime != l.Runtime || input.Claimant != request.Claimant || input.Claimant != l.Claimant || input.SnapshotDigest != request.Snapshot.Digest || input.SnapshotDigest != l.SnapshotHash || !input.IssuedAt.Equal(l.IssuedAt) || !input.StartBy.Equal(l.StartBy) || !input.ExpiresAt.Equal(l.ExpiresAt) {
+	if input.ClaimID != l.ClaimID || input.Runtime != request.Runtime || input.Runtime != l.Runtime || input.Claimant != request.Claimant || input.Claimant != l.Claimant || input.SnapshotDigest != request.Snapshot.Digest || input.SnapshotDigest != l.SnapshotHash || !input.IssuedAt.Equal(l.IssuedAt) || !input.StartBy.Equal(l.StartBy) || !input.ExpiresAt.Equal(l.ExpiresAt) || !sameSupersession(input.Supersession, request.Supersession) || !sameSupersession(input.Supersession, l.Supersession) {
 		return ErrInvalidLease
 	}
 	return nil
+}
+
+func sameSupersession(left, right *Supersession) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
 }
 
 type LedgerEntry struct {
@@ -301,7 +337,9 @@ type Status struct {
 
 // RuntimeCoordinator is the daemon-facing external trust boundary. Acquire
 // returns a signed packet; Prepare atomically closes admission; Start performs
-// the immediate active-set CAS; terminal transitions alone reopen admission.
+// the immediate active-set CAS. A signed Request supersession may add one
+// exact same-branch lease while admission is already closed; terminal
+// transitions alone reopen admission.
 type RuntimeCoordinator interface {
 	Acquire(context.Context, Request) (Claim, error)
 	Prepare(context.Context, Claim, Snapshot) (Lease, error)

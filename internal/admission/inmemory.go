@@ -92,10 +92,15 @@ func (c *InMemory) Acquire(ctx context.Context, request Request) (Claim, error) 
 	if err := request.Snapshot.Validate(); err != nil || request.Runtime == "" || !request.Claimant.Valid() || request.Snapshot.Runtime != request.Runtime {
 		return Claim{}, ErrClaimScope
 	}
+	if request.Supersession != nil {
+		if err := request.Supersession.validate(request.Snapshot); err != nil {
+			return Claim{}, err
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	state := c.runtime(request.Runtime)
-	if state.closed {
+	if state.closed && (request.Supersession == nil || !canSupersede(state)) {
 		return Claim{}, ErrAdmissionClosed
 	}
 	previous := ""
@@ -112,6 +117,7 @@ func (c *InMemory) Acquire(ctx context.Context, request Request) (Claim, error) 
 		IssuedAt:       now,
 		StartBy:        now.Add(c.startWindow),
 		ExpiresAt:      now.Add(c.leaseWindow),
+		Supersession:   request.Supersession,
 	})
 }
 
@@ -131,8 +137,16 @@ func (c *InMemory) Prepare(ctx context.Context, claim Claim, snapshot Snapshot) 
 	if input.SnapshotDigest != snapshot.Digest {
 		return Lease{}, ErrClaimScope
 	}
+	if input.Supersession != nil {
+		if err := input.Supersession.validate(snapshot); err != nil {
+			return Lease{}, err
+		}
+	}
 	state := c.runtime(snapshot.Runtime)
-	if state.closed {
+	if state.closed && (input.Supersession == nil || !canSupersede(state)) {
+		return Lease{}, ErrAdmissionClosed
+	}
+	if !state.closed && input.Supersession != nil {
 		return Lease{}, ErrAdmissionClosed
 	}
 	if _, used := state.claims[input.ClaimID]; used {
@@ -161,11 +175,14 @@ func (c *InMemory) Prepare(ctx context.Context, claim Claim, snapshot Snapshot) 
 		IssuedAt:     input.IssuedAt,
 		StartBy:      input.StartBy,
 		ExpiresAt:    input.ExpiresAt,
+		Supersession: cloneSupersession(input.Supersession),
 	}
 	entry := c.append(state, lease, StatePrepared, "")
 	lease.LedgerSeq, lease.LedgerHash = entry.Sequence, entry.Hash
 	state.claims[lease.ClaimID] = StatePrepared
-	state.leases[lease.LeaseID] = lease
+	storedLease := lease
+	storedLease.Supersession = cloneSupersession(lease.Supersession)
+	state.leases[lease.LeaseID] = storedLease
 	return lease, nil
 }
 
@@ -226,7 +243,7 @@ func (c *InMemory) Abort(ctx context.Context, lease Lease, evidence string) erro
 	}
 	c.append(state, stored, StateAborted, evidence)
 	state.claims[stored.ClaimID] = StateAborted
-	state.closed = false
+	refreshClosed(state)
 	return nil
 }
 
@@ -238,7 +255,7 @@ func (c *InMemory) terminal(lease Lease, terminal State, evidence string) error 
 		return ErrUnknownLease
 	}
 	stored, found := state.leases[lease.LeaseID]
-	if !found || stored != lease {
+	if !found || !sameLease(stored, lease) {
 		return ErrUnknownLease
 	}
 	if state.claims[stored.ClaimID] != StateStarted {
@@ -246,8 +263,43 @@ func (c *InMemory) terminal(lease Lease, terminal State, evidence string) error 
 	}
 	c.append(state, stored, terminal, evidence)
 	state.claims[stored.ClaimID] = terminal
-	state.closed = false
+	refreshClosed(state)
 	return nil
+}
+
+func canSupersede(state *runtimeState) bool {
+	started, prepared := 0, 0
+	for _, status := range state.claims {
+		switch status {
+		case StateStarted:
+			started++
+		case StatePrepared:
+			prepared++
+		}
+	}
+	return started == 1 && prepared == 0
+}
+
+func refreshClosed(state *runtimeState) {
+	state.closed = false
+	for _, status := range state.claims {
+		if status == StatePrepared || status == StateStarted {
+			state.closed = true
+			return
+		}
+	}
+}
+
+func cloneSupersession(value *Supersession) *Supersession {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	return &clone
+}
+
+func sameLease(left, right Lease) bool {
+	return left.ClaimID == right.ClaimID && left.LeaseID == right.LeaseID && left.Runtime == right.Runtime && left.Claimant == right.Claimant && left.SnapshotHash == right.SnapshotHash && left.Generation == right.Generation && left.IssuedAt.Equal(right.IssuedAt) && left.StartBy.Equal(right.StartBy) && left.ExpiresAt.Equal(right.ExpiresAt) && left.LedgerSeq == right.LedgerSeq && left.LedgerHash == right.LedgerHash && sameSupersession(left.Supersession, right.Supersession)
 }
 
 func (c *InMemory) prepared(lease Lease) (*runtimeState, Lease, error) {
@@ -256,7 +308,7 @@ func (c *InMemory) prepared(lease Lease) (*runtimeState, Lease, error) {
 		return nil, Lease{}, ErrUnknownLease
 	}
 	stored, found := state.leases[lease.LeaseID]
-	if !found || stored != lease {
+	if !found || !sameLease(stored, lease) {
 		return nil, Lease{}, ErrUnknownLease
 	}
 	if state.claims[stored.ClaimID] != StatePrepared {

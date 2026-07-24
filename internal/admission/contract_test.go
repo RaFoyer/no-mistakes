@@ -59,6 +59,19 @@ func TestClaimAuthenticationRejectsForgeryFutureAndExpiry(t *testing.T) {
 	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), input.Runtime, input.Claimant, now); err != nil {
 		t.Fatalf("verify valid claim: %v", err)
 	}
+	supersession := &Supersession{Target: snapshot.Runs[0]}
+	supersedingInput := input
+	supersedingInput.ClaimID = "claim-superseding"
+	supersedingInput.Supersession = supersession
+	supersedingClaim, err := SignClaim(key, supersedingInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperedSupersedingClaim := supersedingClaim
+	tamperedSupersedingClaim.Input.Supersession = &Supersession{Target: ActiveRun{ID: "run-a", RepoID: "repo-a", Branch: "feature/other", HeadSHA: "aaaaaaaa", Status: "running"}}
+	if err := VerifyClaim(tamperedSupersedingClaim, key.Public().(ed25519.PublicKey), input.Runtime, input.Claimant, now); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("tampered supersession error = %v, want %v", err, ErrInvalidSignature)
+	}
 	forged := claim
 	forged.Signature = append([]byte(nil), claim.Signature...)
 	forged.Signature[0] ^= 0xff
@@ -172,6 +185,172 @@ func TestInMemoryCoordinatorLifecycleCASReplayAndReopen(t *testing.T) {
 	}
 	if _, err := coordinator.Acquire(ctx, req); err != nil {
 		t.Fatalf("admission did not reopen after failed terminal: %v", err)
+	}
+}
+
+func TestInMemoryCoordinatorSupersessionIsScopedAndKeepsAdmissionClosed(t *testing.T) {
+	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	coordinator, err := NewInMemory(InMemoryConfig{
+		PrivateKey: testSigningKey(), Clock: func() time.Time { return now }, NextID: deterministicIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	empty := NewSnapshot("nm-runtime/test", nil)
+	active := testSnapshot()
+	request := Request{Runtime: active.Runtime, Claimant: testClaimant, Snapshot: empty}
+	claim, err := coordinator.Acquire(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldLease, err := coordinator.Prepare(ctx, claim, empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Start(ctx, oldLease, empty); err != nil {
+		t.Fatal(err)
+	}
+
+	supersession := &Supersession{Target: active.Runs[0]}
+	for _, test := range []struct {
+		name   string
+		target ActiveRun
+	}{
+		{name: "different repository", target: ActiveRun{ID: "run-a", RepoID: "repo-other", Branch: "feature/a", HeadSHA: "aaaaaaaa", Status: "running"}},
+		{name: "different branch", target: ActiveRun{ID: "run-a", RepoID: "repo-a", Branch: "feature/other", HeadSHA: "aaaaaaaa", Status: "running"}},
+		{name: "stale head", target: ActiveRun{ID: "run-a", RepoID: "repo-a", Branch: "feature/a", HeadSHA: "stale", Status: "running"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bad := *supersession
+			bad.Target = test.target
+			_, err := coordinator.Acquire(ctx, Request{Runtime: active.Runtime, Claimant: testClaimant, Snapshot: active, Supersession: &bad})
+			if !errors.Is(err, ErrSupersessionScope) {
+				t.Fatalf("supersession error = %v, want %v", err, ErrSupersessionScope)
+			}
+		})
+	}
+
+	changed := NewSnapshot(active.Runtime, append(active.Runs, ActiveRun{ID: "run-b", RepoID: "repo-b", Branch: "feature/b", HeadSHA: "bbbbbbbb", Status: "running"}))
+	claim, err = coordinator.Acquire(ctx, Request{Runtime: active.Runtime, Claimant: testClaimant, Snapshot: active, Supersession: supersession})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := coordinator.Prepare(ctx, claim, active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Start(ctx, prepared, changed); !errors.Is(err, ErrActiveSetChanged) {
+		t.Fatalf("changed active set error = %v, want %v", err, ErrActiveSetChanged)
+	}
+	if err := coordinator.Abort(ctx, prepared, "active set changed"); err != nil {
+		t.Fatal(err)
+	}
+
+	claim, err = coordinator.Acquire(ctx, Request{Runtime: active.Runtime, Claimant: testClaimant, Snapshot: active, Supersession: supersession})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newLease, err := coordinator.Prepare(ctx, claim, active)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Start(ctx, newLease, active); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Acquire(ctx, Request{Runtime: active.Runtime, Claimant: testClaimant, Snapshot: active}); !errors.Is(err, ErrAdmissionClosed) {
+		t.Fatalf("unrelated start error = %v, want %v", err, ErrAdmissionClosed)
+	}
+	status := coordinator.Status(ctx, active.Runtime)
+	if !status.AdmissionClosed {
+		t.Fatal("admission reopened while superseded and superseding leases were active")
+	}
+	if err := coordinator.Complete(ctx, oldLease, "superseded"); err != nil {
+		t.Fatal(err)
+	}
+	if status := coordinator.Status(ctx, active.Runtime); !status.AdmissionClosed {
+		t.Fatal("admission reopened after only the superseded lease terminalized")
+	}
+	if err := coordinator.Complete(ctx, newLease, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	status = coordinator.Status(ctx, active.Runtime)
+	if status.AdmissionClosed || status.State != StateCompleted {
+		t.Fatalf("terminal supersession status = %+v", status)
+	}
+	if err := ValidateLedger(status.Entries); err != nil {
+		t.Fatalf("supersession ledger: %v", err)
+	}
+}
+
+func TestInMemoryCoordinatorSupersessionRaceHasOneWinner(t *testing.T) {
+	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	coordinator, err := NewInMemory(InMemoryConfig{
+		PrivateKey: testSigningKey(), Clock: func() time.Time { return now }, NextID: deterministicIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	empty := NewSnapshot("nm-runtime/test", nil)
+	active := testSnapshot()
+	claim, err := coordinator.Acquire(ctx, Request{Runtime: active.Runtime, Claimant: testClaimant, Snapshot: empty})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldLease, err := coordinator.Prepare(ctx, claim, empty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Start(ctx, oldLease, empty); err != nil {
+		t.Fatal(err)
+	}
+
+	request := Request{Runtime: active.Runtime, Claimant: testClaimant, Snapshot: active, Supersession: &Supersession{Target: active.Runs[0]}}
+	const contenders = 16
+	start := make(chan struct{})
+	leases := make(chan Lease, contenders)
+	errs := make(chan error, contenders)
+	for i := 0; i < contenders; i++ {
+		go func() {
+			<-start
+			claim, err := coordinator.Acquire(ctx, request)
+			if err == nil {
+				var lease Lease
+				lease, err = coordinator.Prepare(ctx, claim, active)
+				if err == nil {
+					err = coordinator.Start(ctx, lease, active)
+					if err == nil {
+						leases <- lease
+					}
+				}
+			}
+			errs <- err
+		}()
+	}
+	close(start)
+	var winner Lease
+	winners := 0
+	for i := 0; i < contenders; i++ {
+		if err := <-errs; err == nil {
+			winners++
+			winner = <-leases
+		} else if !errors.Is(err, ErrAdmissionClosed) && !errors.Is(err, ErrLedgerConflict) {
+			t.Fatalf("supersession race error = %v", err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("supersession race winners = %d, want 1", winners)
+	}
+	status := coordinator.Status(ctx, active.Runtime)
+	if !status.AdmissionClosed || len(status.Entries) != 4 {
+		t.Fatalf("supersession race status = %+v", status)
+	}
+	if err := coordinator.Complete(ctx, oldLease, "superseded"); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Complete(ctx, winner, "completed"); err != nil {
+		t.Fatal(err)
 	}
 }
 

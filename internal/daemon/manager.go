@@ -676,15 +676,21 @@ func (m *RunManager) abortPreparedAdmission(lease admission.Lease, evidence stri
 }
 
 // acquireStartAdmission closes shared-runtime admission and performs the
-// immediate pre-action active-set compare-and-swap. It is deliberately called
-// before cancelActiveRuns, InsertRun, WorktreeAdd, or any other start-side
-// mutation. A coordinator failure therefore cannot disturb an existing run.
-func (m *RunManager) acquireStartAdmission(ctx context.Context) (admission.Lease, error) {
+// immediate pre-action active-set compare-and-swap. A single exact active
+// same-branch run may use bounded supersession while admission is closed; all
+// other starts remain rejected. It is deliberately called before
+// cancelActiveRuns, InsertRun, WorktreeAdd, or any other start-side mutation.
+// A coordinator failure therefore cannot disturb an existing run.
+func (m *RunManager) acquireStartAdmission(ctx context.Context, repoID, branch string) (admission.Lease, error) {
 	snapshot, err := m.currentAdmissionSnapshot()
 	if err != nil {
 		return admission.Lease{}, err
 	}
-	request := admission.Request{Runtime: m.runtimeScope, Claimant: m.claimant, Snapshot: snapshot}
+	var supersession *admission.Supersession
+	if len(snapshot.Runs) == 1 && snapshot.Runs[0].RepoID == repoID && snapshot.Runs[0].Branch == branch {
+		supersession = &admission.Supersession{Target: snapshot.Runs[0]}
+	}
+	request := admission.Request{Runtime: m.runtimeScope, Claimant: m.claimant, Snapshot: snapshot, Supersession: supersession}
 	var claim admission.Claim
 	err = runAdmissionCall(ctx, func(callCtx context.Context) error {
 		var acquireErr error
@@ -749,7 +755,7 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 	branchMu.Lock()
 	defer branchMu.Unlock()
 
-	lease, err := m.acquireStartAdmission(ctx)
+	lease, err := m.acquireStartAdmission(ctx, repo.ID, branch)
 	if err != nil {
 		trackStartFailure("admission")
 		return "", err
