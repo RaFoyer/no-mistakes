@@ -4,9 +4,11 @@ description: What no-mistakes is and why it exists.
 ---
 
 `no-mistakes` puts a local git proxy in front of your real remote. Push to
-`no-mistakes` instead of `origin`, and it spins up a disposable worktree, runs
-an AI-driven validation pipeline, forwards the branch to the configured push
-target only after every check passes, and opens a clean PR automatically.
+`no-mistakes` instead of `origin`, and, after shared-runtime admission, it
+spins up a disposable worktree, runs an AI-driven validation pipeline, forwards
+the branch to the configured push target only after every check passes, and
+opens a clean PR automatically. The admission contract and the current
+inactive source-build default are documented in [Daemon & Worktrees](/no-mistakes/concepts/daemon/#shared-runtime-admission).
 
 ## The Bottleneck Moved
 
@@ -50,7 +52,8 @@ flowchart LR
   repo["Your repo"] -->|"git push no-mistakes"| gate["Local gate repo"]
   gate --> hook["post-receive hook"]
   hook --> daemon["Daemon"]
-  daemon --> worktree["Disposable worktree"]
+  daemon --> admission["Shared-runtime admission"]
+  admission --> worktree["Disposable worktree"]
   worktree --> pipeline["intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci"]
   pipeline --> target["Push target"]
 ```
@@ -73,14 +76,14 @@ When a branch passes the gate, it means:
 - Choice of agent: `claude`, `codex`, `rovodev`, `opencode`, `pi`, `copilot`, or `acp:<target>` via `acpx`, with per-repo override and ordered fallbacks; every gate requires a runnable configured pipeline agent.
 - A TUI to watch, approve, fix, skip, or abort any step.
 - A `/no-mistakes` agent skill so a coding agent can do a task and gate it, or gate existing committed work, backed by a non-interactive `no-mistakes axi` interface.
-- A setup wizard when you run bare `no-mistakes` with no active run on the current branch - it walks you through creating a branch, committing, and pushing through the gate, then attaches if the daemon registers the new run.
+- A setup wizard when you run bare `no-mistakes` with no active run on the current branch - it walks you through creating a branch, committing, and pushing through the gate, then attaches if admission succeeds and the daemon registers the new run.
 
 ## Three ways to trigger the gate
 
 The pipeline is the same no matter how you start it. There are three first-class entry points, one for each way you tend to be working when a change is ready:
 
 - **`git push no-mistakes`** - the explicit Git path. You push a committed branch to the gate remote instead of `origin`, and the daemon takes it from there. See [Quick Start](/no-mistakes/start-here/quick-start/).
-- **`no-mistakes`** - the terminal UI. Run it after making changes and a [setup wizard](/no-mistakes/guides/setup-wizard/) walks you through branch, commit, and push, then attaches to the live run so you can watch, approve, fix, skip, or abort each step.
+- **`no-mistakes`** - the terminal UI. Run it after making changes and a [setup wizard](/no-mistakes/guides/setup-wizard/) walks you through branch, commit, and push, then attaches to the live run when admission succeeds so you can watch, approve, fix, skip, or abort each step.
 - **`/no-mistakes`** - the agent skill. Tell a coding agent `/no-mistakes <task>` to have it do the task, commit it on a feature branch, and then gate it with that task as intent; use bare `/no-mistakes` to gate existing committed work. It resolves safe findings on its own and stops to relay anything that needs your decision. See [Driving no-mistakes as an agent](/no-mistakes/guides/agents/#driving-no-mistakes-as-an-agent).
 
 `no-mistakes init` installs the `/no-mistakes` skill at user level for every supported agent, so it works in all your repos. The skill drives `no-mistakes axi`, a non-interactive command surface that prints [TOON](https://toonformat.dev) to stdout, so an agent reaches the same gate and the same approval points you get in the TUI.

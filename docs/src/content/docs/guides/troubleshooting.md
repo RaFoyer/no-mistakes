@@ -210,6 +210,16 @@ Also check `<gate-path>/notify-push.log`. The hook now appends daemon notificati
 
 The hook talks to the daemon over `~/.no-mistakes/socket`. If the daemon isn't running, the push still succeeds (the hook never blocks), but no pipeline starts. Start the daemon and push again.
 
+### Check shared-runtime admission
+
+If the daemon is running and the hook is healthy but no run appears, check the
+admission boundary described in [Daemon & Worktrees](/no-mistakes/concepts/daemon/#shared-runtime-admission).
+The normal source build deliberately has no coordinator adapter, so fresh
+starts fail closed before cancelling an active run or creating local run,
+receipt, or worktree state. `no-mistakes coordinator status` reports that
+inactive state and shows only local correlation evidence; it cannot enable,
+recover, or reopen admission.
+
 If the gate is older, re-running `no-mistakes init` or restarting the daemon also reapplies hook-path isolation for existing bare repos when Git supports `config --worktree`.
 That protects the gate hook if a tool such as Husky wrote `core.hookspath` into shared git config from inside a linked worktree.
 

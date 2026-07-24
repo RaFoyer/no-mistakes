@@ -16,7 +16,8 @@ flowchart TD
   repo["Working repo"] -->|"git push no-mistakes"| gate["Local bare gate repo"]
   gate --> hook["post-receive hook"]
   hook --> daemon["Daemon"]
-  daemon --> worktree["Disposable worktree"]
+  daemon --> admission["Shared-runtime admission"]
+  admission --> worktree["Disposable worktree"]
   worktree --> pipeline["intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci"]
   pipeline --> target["Push target"]
   daemon --> db["SQLite state"]
@@ -36,7 +37,7 @@ When you run `no-mistakes init` in a repo:
 5. It adds a `no-mistakes` remote to your working repo that points at the gate.
 6. When `--fork-url` is supplied, it records that GitHub fork as the branch push target while keeping `origin` as the parent repository used for PR bases.
 7. It installs or refreshes the `/no-mistakes` agent skill at user level, into `~/.claude/skills/no-mistakes/SKILL.md` and `~/.agents/skills/no-mistakes/SKILL.md`, on a best-effort basis, following existing symlinks between the home `.claude` and `.agents` skill directories. It writes no skill files into the repo; if the repo still carries a vendored copy from an older version, `init` prints a notice that the copy can be removed.
-8. It makes sure the daemon is running so incoming pushes can start runs.
+8. It makes sure the daemon is running so incoming pushes can request admission and start runs when the coordinator allows them.
 
 `init` is idempotent.
 If the repo is already initialized, it refreshes the existing gate instead of failing: managed hook installation, push-option support, hook-path isolation, gate and working remotes, origin/default-branch metadata, and the `/no-mistakes` agent skill are repaired or updated where needed.
@@ -53,15 +54,16 @@ That is a core design choice, not an implementation detail.
 1. You run `git push no-mistakes <branch>`.
 2. Git writes the push into the local bare gate repo, so the push itself stays fast.
 3. The gate repo's `post-receive` hook notifies the daemon.
-4. The daemon creates a detached worktree for this run.
-5. The pipeline runs in order: `intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`.
-6. If a step pauses, you can attach with the TUI or use `no-mistakes axi respond` to approve, fix, or skip.
+4. The daemon obtains shared-runtime admission for the exact active-run snapshot. If the coordinator is unavailable or the snapshot changes, the local push can succeed but no run starts.
+5. After admission, the daemon creates a detached worktree for this run.
+6. The pipeline runs in order: `intent -> rebase -> review -> test -> document -> lint -> push -> pr -> ci`.
+7. If a step pauses, you can attach with the TUI or use `no-mistakes axi respond` to approve, fix, or skip.
    Use `no-mistakes axi abort` only when you mean to cancel the whole run.
    AXI run objects show `awaiting_agent: parked <duration>` while a non-terminal run is parked at that gate, so a supervising agent can distinguish a waiting run from active work in one status read.
    While a step is actively running or fixing, AXI run objects can also show `active_steps` with the active duration, latest activity, native agent PID, and current execution or fix round.
-7. After local checks pass, the push step forwards the branch to the configured push target only after verifying that the update will not discard unincorporated commits already on that target, and the PR step creates or updates the pull request.
+8. After local checks pass, the push step forwards the branch to the configured push target only after verifying that the update will not discard unincorporated commits already on that target, and the PR step creates or updates the pull request.
    For GitHub fork routing, the push target is the fork and the PR base repository is the parent from `origin`.
-8. The CI step keeps watching the open PR until it is merged, closed, or its configured idle timeout elapses with no base-branch movement, and can auto-fix failures or merge conflicts when supported.
+9. The CI step keeps watching the open PR until it is merged, closed, or its configured idle timeout elapses with no base-branch movement, and can auto-fix failures or merge conflicts when supported.
    While it watches, the TUI and terminal title surface a `Checks passed` signal once checks are green and the PR is mergeable, and `no-mistakes axi` returns `outcome: checks-passed` with instructions to summarize the run and list any pipeline fixes, so agents stop and ask you to review and merge it.
 
 **Key design decisions:**
@@ -123,7 +125,7 @@ A long-running background process that manages pipeline runs. It:
 - Listens on a Unix socket at `~/.no-mistakes/socket`
 - Writes its identity record to `~/.no-mistakes/daemon.pid`
 - Holds an exclusive OS lock on `~/.no-mistakes/daemon.lock` for its whole lifetime, so only one live daemon can own an `NM_HOME` at a time
-- Serializes concurrent pushes to the same branch (new push cancels the in-progress run)
+- Requests shared-runtime admission before cancelling or replacing an in-progress run; the exact contract is owned by [Daemon & Worktrees](/no-mistakes/concepts/daemon/#shared-runtime-admission)
 - Creates and cleans up worktrees
 - Scopes configured commands and one-shot agent subprocesses to the step lifetime by terminating remaining child processes on completion, failure, or cancellation
 - Persists state to SQLite

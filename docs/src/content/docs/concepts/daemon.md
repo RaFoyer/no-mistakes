@@ -8,6 +8,35 @@ installer prefers setting it up as a managed background service, and
 `no-mistakes`, `init`, `attach`, `rerun`, and `update` keep that service
 installed and running for you when that path is available.
 
+## Shared-runtime admission
+
+Before a new push or rerun can cancel an active run, write a run or admission
+receipt, or create a worktree, the daemon must obtain shared-runtime admission.
+It sends the coordinator a canonical snapshot of the exact active local runs,
+receives a cryptographically authenticated, bounded claim, and validates the
+resulting immutable lease. The coordinator then performs an immediate
+compare-and-swap against a fresh active-set snapshot. A same-branch
+supersession may name only the one exact active run in that snapshot; it cannot
+broaden cancellation after admission.
+
+The coordinator records the lifecycle as a hash-linked ledger:
+`prepared -> started -> completed|failed`, or `prepared -> aborted` when setup
+does not reach a run. Admission stays closed from `prepared` through the run's
+terminal transition; only that coordinator transition can reopen it.
+
+The normal source build deliberately ships with the external coordinator
+inactive. This source-only admission lane has no endpoint, credentials,
+deployment, installation, local fallback, recovery action, daemon mutation, or
+active-run mutation path. A fresh start therefore fails closed before
+same-branch cancellation or local run, receipt, and worktree mutation; an
+existing active run is left alone. The in-memory coordinator exists only for
+deterministic adversarial tests and is not a production configuration.
+
+`no-mistakes coordinator status` is read-only. It reports the inactive
+coordinator and any local admission rows as correlation evidence; those rows,
+historical snapshot hashes, and the status output are not the external ledger,
+a lease, a lock, a recovery source, or authority to reopen admission.
+
 ## Why a daemon exists
 
 The daemon exists so `git push no-mistakes` stays fast and the gate can keep
@@ -21,7 +50,8 @@ working after your shell command returns.
 ```mermaid
 flowchart LR
   push["git push no-mistakes"] --> gate["Gate repo hook"] --> daemon["Daemon"]
-  daemon --> run["Run in detached worktree"]
+  daemon --> admission["Shared-runtime admission"]
+  admission --> run["Run in detached worktree"]
   daemon --> state["Persist state + logs"]
   run --> tui["TUI can attach or detach"]
   run --> cleanup["Cleanup when run finishes"]
@@ -75,10 +105,15 @@ As an independent safety layer, the daemon also refuses to bind the Unix socket 
 
 When a push arrives via the post-receive hook:
 
-1. Creates a detached worktree at `~/.no-mistakes/worktrees/<repoID>/<runID>/`
-2. Starts the pipeline executor in that worktree
-3. Streams events to any connected TUI clients and serves request/response state to AXI clients
-4. Cleans up the worktree when the run finishes (success or failure)
+1. Obtains shared-runtime admission for the exact active-run snapshot
+2. Creates a detached worktree at `~/.no-mistakes/worktrees/<repoID>/<runID>/`
+3. Starts the pipeline executor in that worktree
+4. Streams events to any connected TUI clients and serves request/response state to AXI clients
+5. Cleans up the worktree when the run finishes (success or failure)
+
+If admission is unavailable or the active set changes before the compare-and-
+swap, the hook's local Git push can still succeed, but no pipeline run starts.
+The hook and daemon logs contain the notification or admission error.
 
 Pipeline agents are prompted to keep intentional writes inside that detached worktree and avoid changing system state outside it, such as Homebrew packages, apps under `/Applications`, or global tool configuration.
 That reduces surprising machine-level side effects and macOS App Management prompts, but it is prompt steering rather than a true sandbox.
@@ -87,13 +122,19 @@ Configured commands and one-shot agent subprocesses are terminated as a process 
 
 ## Concurrent push handling
 
-If you push to the same branch while a run is already active, the daemon:
+If you push to the same branch while a run is already active, the daemon first
+requires a signed claim whose supersession target exactly matches the active
+run and an immediate active-set compare-and-swap. Only after that succeeds does
+it:
 
 1. Cancels the in-progress run (reason: "cancelled: superseded by new push")
 2. Waits for it to finish
 3. Starts a new run with the latest push
 
-Pushes to different branches run concurrently.
+If admission is unavailable, stale, or scoped to anything other than that one
+exact run, the new start is rejected and the active run is not cancelled.
+Different-branch pushes also require admission and are not guaranteed to run
+concurrently; the current inactive coordinator rejects every fresh start.
 
 This is another reason the daemon exists: branch-level coordination is easier to
 reason about in one long-lived process than inside independent hook invocations.
@@ -111,6 +152,11 @@ On startup, the daemon checks for runs that were left in `pending` or `running` 
 - Reapplies per-worktree gate hook-path isolation to existing bare repos when Git supports `config --worktree`, so shared `core.hookspath` writes cannot disable `post-receive`
 - Enables Git push-option support on existing gate repos so per-push options like `no-mistakes.skip=...` keep working after upgrades
 - Clears any parked-awaiting-agent marker so a recovered failed run is not shown as still waiting for `axi respond`
+
+Crash recovery does not reconstruct admission from local SQLite rows or
+receipt hashes. Local admission receipts remain correlation evidence only; the
+external coordinator, when a separately governed adapter exists, owns the
+admission ledger and any transition that reopens it.
 
 ## Logging
 
