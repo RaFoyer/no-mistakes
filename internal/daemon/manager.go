@@ -30,7 +30,10 @@ import (
 // StepFactory creates pipeline steps for a run. Defaults to steps.AllSteps.
 type StepFactory func() []pipeline.Step
 
-var recoveredConfigFetchTimeout = 10 * time.Second
+var (
+	recoveredConfigFetchTimeout = 10 * time.Second
+	admissionCallTimeout        = 10 * time.Second
+)
 
 var fetchRecoveredRemoteBranch = git.FetchRemoteBranch
 
@@ -658,6 +661,12 @@ func (m *RunManager) currentAdmissionSnapshot() (admission.Snapshot, error) {
 	return admission.NewSnapshot(m.runtimeScope, active), nil
 }
 
+func runAdmissionCall(parent context.Context, call func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(parent, admissionCallTimeout)
+	defer cancel()
+	return call(ctx)
+}
+
 // acquireStartAdmission closes shared-runtime admission and performs the
 // immediate pre-action active-set compare-and-swap. It is deliberately called
 // before cancelActiveRuns, InsertRun, WorktreeAdd, or any other start-side
@@ -667,25 +676,42 @@ func (m *RunManager) acquireStartAdmission(ctx context.Context) (admission.Lease
 	if err != nil {
 		return admission.Lease{}, err
 	}
-	claim, err := m.admission.Acquire(ctx, admission.Request{
-		Runtime: m.runtimeScope, Claimant: m.claimant, Snapshot: snapshot,
+	var claim admission.Claim
+	err = runAdmissionCall(ctx, func(callCtx context.Context) error {
+		var acquireErr error
+		claim, acquireErr = m.admission.Acquire(callCtx, admission.Request{
+			Runtime: m.runtimeScope, Claimant: m.claimant, Snapshot: snapshot,
+		})
+		return acquireErr
 	})
 	if err != nil {
 		return admission.Lease{}, fmt.Errorf("acquire shared-runtime admission: %w", err)
 	}
-	lease, err := m.admission.Prepare(ctx, claim, snapshot)
+	var lease admission.Lease
+	err = runAdmissionCall(ctx, func(callCtx context.Context) error {
+		var prepareErr error
+		lease, prepareErr = m.admission.Prepare(callCtx, claim, snapshot)
+		return prepareErr
+	})
 	if err != nil {
 		return admission.Lease{}, fmt.Errorf("prepare shared-runtime admission: %w", err)
 	}
 	current, snapshotErr := m.currentAdmissionSnapshot()
 	if snapshotErr != nil {
-		if abortErr := m.admission.Abort(context.Background(), lease, "cannot reread active set before start"); abortErr != nil {
+		if abortErr := runAdmissionCall(context.Background(), func(callCtx context.Context) error {
+			return m.admission.Abort(callCtx, lease, "cannot reread active set before start")
+		}); abortErr != nil {
 			slog.Error("failed to abort prepared admission after active-set read failure", "claim_id", lease.ClaimID, "error", abortErr)
 		}
 		return admission.Lease{}, snapshotErr
 	}
-	if err := m.admission.Start(ctx, lease, current); err != nil {
-		if abortErr := m.admission.Abort(context.Background(), lease, "pre-action compare-and-swap rejected"); abortErr != nil {
+	err = runAdmissionCall(ctx, func(callCtx context.Context) error {
+		return m.admission.Start(callCtx, lease, current)
+	})
+	if err != nil {
+		if abortErr := runAdmissionCall(context.Background(), func(callCtx context.Context) error {
+			return m.admission.Abort(callCtx, lease, "pre-action compare-and-swap rejected")
+		}); abortErr != nil {
 			slog.Error("failed to abort prepared admission after compare-and-swap rejection", "claim_id", lease.ClaimID, "error", abortErr)
 		}
 		return admission.Lease{}, fmt.Errorf("start shared-runtime admission: %w", err)
@@ -737,7 +763,9 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 		// Failure to record the terminal transition must leave admission closed
 		// rather than guessing that a new start is safe. The coordinator ledger,
 		// not this process, owns reopening.
-		if failErr := m.admission.Fail(context.Background(), lease, "run start setup failed"); failErr != nil {
+		if failErr := runAdmissionCall(context.Background(), func(callCtx context.Context) error {
+			return m.admission.Fail(callCtx, lease, "run start setup failed")
+		}); failErr != nil {
 			slog.Error("failed to terminalize shared-runtime admission", "claim_id", lease.ClaimID, "error", failErr)
 		} else if admissionReceiptRunID != "" {
 			if receiptErr := m.db.UpdateAdmissionReceiptTerminal(admissionReceiptRunID, "failed"); receiptErr != nil {
@@ -997,7 +1025,9 @@ func (m *RunManager) startRun(ctx context.Context, repo *db.Repo, branch, headSH
 			} else if run.Error != nil && *run.Error != "" {
 				evidence = *run.Error
 			}
-			if admissionErr := terminalize(context.Background(), lease, evidence); admissionErr != nil {
+			if admissionErr := runAdmissionCall(context.Background(), func(callCtx context.Context) error {
+				return terminalize(callCtx, lease, evidence)
+			}); admissionErr != nil {
 				// Fail closed: only the coordinator can determine whether a
 				// terminal transition safely reopened the shared runtime.
 				slog.Error("failed to terminalize shared-runtime admission", "claim_id", lease.ClaimID, "error", admissionErr)

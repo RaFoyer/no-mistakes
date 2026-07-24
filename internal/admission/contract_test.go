@@ -344,3 +344,41 @@ func TestLedgerRejectsImmutableLeaseMutationEvenWhenRehashed(t *testing.T) {
 		t.Fatalf("mutated lease error = %v, want %v", err, ErrInvalidTransition)
 	}
 }
+
+func TestLedgerRejectsRehashedClaimReplayAcrossLeases(t *testing.T) {
+	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	coordinator, err := NewInMemory(InMemoryConfig{
+		PrivateKey: testSigningKey(), Clock: func() time.Time { return now }, NextID: deterministicIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	snapshot := testSnapshot()
+	claim, err := coordinator.Acquire(ctx, Request{Runtime: snapshot.Runtime, Claimant: testClaimant, Snapshot: snapshot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := coordinator.Prepare(ctx, claim, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Start(ctx, lease, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Complete(ctx, lease, "done"); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := append([]LedgerEntry(nil), coordinator.Status(ctx, snapshot.Runtime).Entries...)
+	for _, entry := range append([]LedgerEntry(nil), entries...) {
+		entry.Sequence = uint64(len(entries) + 1)
+		entry.PriorHash = entries[len(entries)-1].Hash
+		entry.LeaseID = "replayed-lease"
+		entry.Hash = ledgerHash(entry)
+		entries = append(entries, entry)
+	}
+	if err := ValidateLedger(entries); !errors.Is(err, ErrClaimReplay) {
+		t.Fatalf("replayed claim error = %v, want %v", err, ErrClaimReplay)
+	}
+}

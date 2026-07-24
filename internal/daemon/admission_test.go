@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kunchenguid/no-mistakes/internal/admission"
 	"github.com/kunchenguid/no-mistakes/internal/db"
@@ -13,6 +14,24 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func TestAdmissionCallsHaveBoundedContexts(t *testing.T) {
+	originalTimeout := admissionCallTimeout
+	admissionCallTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { admissionCallTimeout = originalTimeout })
+
+	started := time.Now()
+	err := runAdmissionCall(context.Background(), func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("admission call error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("admission call took %s, want under one second", elapsed)
+	}
+}
 
 func TestStartRunUnavailableAdmissionPreventsCancellationAndRunInsert(t *testing.T) {
 	p := paths.WithRoot(t.TempDir())

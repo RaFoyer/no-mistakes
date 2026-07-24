@@ -241,6 +241,7 @@ func ledgerHash(entry LedgerEntry) string {
 func ValidateLedger(entries []LedgerEntry) error {
 	prior := ""
 	states := make(map[string]State, len(entries))
+	claimLeases := make(map[string]string, len(entries))
 	type leaseIdentity struct {
 		claimID      string
 		claimant     Claimant
@@ -255,6 +256,9 @@ func ValidateLedger(entries []LedgerEntry) error {
 			return fmt.Errorf("ledger entry %d is incomplete", index+1)
 		}
 		key := entry.Runtime + "\x00" + entry.LeaseID
+		if leaseKey, claimed := claimLeases[entry.ClaimID]; claimed && leaseKey != key {
+			return fmt.Errorf("ledger entry %d reuses claim: %w", index+1, ErrClaimReplay)
+		}
 		state, seen := states[key]
 		identity := leaseIdentity{claimID: entry.ClaimID, claimant: entry.Claimant, snapshotHash: entry.SnapshotHash}
 		if priorIdentity, recorded := identities[key]; recorded && priorIdentity != identity {
@@ -267,6 +271,7 @@ func ValidateLedger(entries []LedgerEntry) error {
 			return fmt.Errorf("ledger entry %d: %w", index+1, ErrInvalidTransition)
 		}
 		identities[key] = identity
+		claimLeases[entry.ClaimID] = key
 		states[key] = entry.State
 		prior = entry.Hash
 	}
