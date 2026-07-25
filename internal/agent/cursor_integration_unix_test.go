@@ -477,6 +477,103 @@ func TestCursorHomeDirDoesNotRepairCredentialFileAtWorkerSocketPath(t *testing.T
 	}
 }
 
+func TestCursorHomeDirRemovesExpectedAgentRuntimeSymlink(t *testing.T) {
+	home := privateCursorHome(t)
+	link, target := createCursorAgentRuntimeSymlink(t, home, "2026.07.23-e383d2b")
+	if err := validateCursorHomeDir(home); err != nil {
+		t.Fatalf("validate home with expected agent symlink: %v", err)
+	}
+	if _, err := os.Lstat(link); !os.IsNotExist(err) {
+		t.Fatalf("agent symlink still exists after cleanup: %v", err)
+	}
+	if info, err := os.Stat(target); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("agent target changed: info=%v err=%v", info, err)
+	}
+}
+
+func TestCursorHomeDirRejectsUnexpectedRuntimeSymlinks(t *testing.T) {
+	tests := []struct {
+		name, linkName, version string
+		outside                 bool
+	}{
+		{"other link name", "cursor-agent", "2026.07.23-e383d2b", false},
+		{"invalid version", "agent", "latest", false},
+		{"outside target", "agent", "2026.07.23-e383d2b", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := privateCursorHome(t)
+			target := filepath.Join(home, ".local", "share", "cursor-agent", "versions", tt.version, "cursor-agent")
+			if tt.outside {
+				target = filepath.Join(filepath.Dir(home), "outside", "cursor-agent")
+			}
+			link := createCursorAgentRuntimeSymlinkAt(t, home, tt.linkName, target)
+			err := validateCursorHomeDir(home)
+			if err == nil || !strings.Contains(err.Error(), "contains symlink") {
+				t.Fatalf("error = %v, want symlink refusal", err)
+			}
+			if _, err := os.Lstat(link); err != nil {
+				t.Fatalf("unexpected symlink was removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestCursorConfigDirRejectsExpectedAgentRuntimeSymlinkShape(t *testing.T) {
+	profile := privateCursorProfile(t)
+	link, _ := createCursorAgentRuntimeSymlink(t, profile, "2026.07.23-e383d2b")
+	err := validateCursorConfigDir(profile)
+	if err == nil || !strings.Contains(err.Error(), "contains symlink") {
+		t.Fatalf("profile symlink error = %v, want refusal", err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("profile symlink was removed: %v", err)
+	}
+}
+
+func TestCursorHomeDirDoesNotRemoveAgentSymlinkToSymlinkedTarget(t *testing.T) {
+	home := privateCursorHome(t)
+	link, target := createCursorAgentRuntimeSymlink(t, home, "2026.07.23-e383d2b")
+	realTarget := target + "-real"
+	if err := os.Rename(target, realTarget); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realTarget, target); err != nil {
+		t.Fatal(err)
+	}
+	err := validateCursorHomeDir(home)
+	if err == nil || !strings.Contains(err.Error(), "contains symlink") {
+		t.Fatalf("error = %v, want symlink refusal", err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("agent symlink was removed: %v", err)
+	}
+}
+
+func createCursorAgentRuntimeSymlink(t *testing.T, home, version string) (string, string) {
+	t.Helper()
+	target := filepath.Join(home, ".local", "share", "cursor-agent", "versions", version, "cursor-agent")
+	return createCursorAgentRuntimeSymlinkAt(t, home, "agent", target), target
+}
+
+func createCursorAgentRuntimeSymlinkAt(t *testing.T, home, linkName, target string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(home, ".local", "bin", linkName)
+	if err := os.MkdirAll(filepath.Dir(link), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	return link
+}
+
 func createCursorWorkerSocket(t *testing.T, root, privateDir, name string) string {
 	t.Helper()
 	dir := filepath.Join(root, ".cursor", privateDir)

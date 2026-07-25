@@ -246,6 +246,15 @@ func validateCursorPrivateTree(path, label, missingDetail string, cleanupRuntime
 			return fmt.Errorf("cursor private tree metadata %q: %w", current, err)
 		}
 		if entry.Type()&os.ModeSymlink != 0 || entryInfo.Mode()&os.ModeSymlink != 0 {
+			if cleanupRuntimeSocket {
+				cleaned, err := cleanupExpectedCursorAgentSymlink(path, current)
+				if err != nil {
+					return err
+				}
+				if cleaned {
+					return nil
+				}
+			}
 			return fmt.Errorf("cursor private tree contains symlink %q", current)
 		}
 		if !entryInfo.IsDir() && !entryInfo.Mode().IsRegular() {
@@ -263,12 +272,47 @@ func validateCursorPrivateTree(path, label, missingDetail string, cleanupRuntime
 		wantMode := os.FileMode(0o600)
 		if entryInfo.IsDir() {
 			wantMode = 0o700
+		} else if cleanupRuntimeSocket && isExpectedCursorRuntimeExecutable(path, current) {
+			wantMode = 0o700
 		}
 		if entryInfo.Mode().Perm() != wantMode {
 			return fmt.Errorf("cursor private tree entry %q has mode %04o; require %04o", current, entryInfo.Mode().Perm(), wantMode)
 		}
 		return validateCursorPrivateTreeOwnership(current, entryInfo)
 	})
+}
+
+func isExpectedCursorRuntimeExecutable(root, path string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	return len(parts) == 6 && parts[0] == ".local" && parts[1] == "share" &&
+		parts[2] == "cursor-agent" && parts[3] == "versions" &&
+		validCursorRuntimeVersion(parts[4]) && parts[5] == "cursor-agent"
+}
+
+func validCursorRuntimeVersion(version string) bool {
+	parts := strings.Split(version, "-")
+	if len(parts) != 2 || len(parts[0]) != len("2026.07.23") || len(parts[1]) != 7 {
+		return false
+	}
+	for index, char := range parts[0] {
+		if index == 4 || index == 7 {
+			if char != '.' {
+				return false
+			}
+		} else if char < '0' || char > '9' {
+			return false
+		}
+	}
+	for _, char := range parts[1] {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func cursorProcessEnv(ctx context.Context, cwd, homeDir, configDir string) []string {

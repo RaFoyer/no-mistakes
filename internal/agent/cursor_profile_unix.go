@@ -60,6 +60,77 @@ func cleanupExpectedCursorWorkerSocket(root, path string, info os.FileInfo) (boo
 	return true, nil
 }
 
+func cleanupExpectedCursorAgentSymlink(root, path string) (bool, error) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false, fmt.Errorf("cursor agent symlink path %q: %w", path, err)
+	}
+	if rel != filepath.Join(".local", "bin", "agent") {
+		return false, nil
+	}
+	linkInfo, err := os.Lstat(path)
+	if err != nil {
+		return false, fmt.Errorf("cursor agent symlink metadata %q: %w", path, err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		return false, nil
+	}
+	if err := validateCursorPrivateTreeOwnership(path, linkInfo); err != nil {
+		return false, err
+	}
+	target, err := os.Readlink(path)
+	if err != nil {
+		return false, fmt.Errorf("read cursor agent symlink %q: %w", path, err)
+	}
+	if !filepath.IsAbs(target) || !isExpectedCursorRuntimeExecutable(root, target) {
+		return false, nil
+	}
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return false, fmt.Errorf("resolve cursor home %q: %w", root, err)
+	}
+	resolvedTarget, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return false, nil
+	}
+	targetRel, err := filepath.Rel(root, target)
+	if err != nil || resolvedTarget != filepath.Join(resolvedRoot, targetRel) {
+		return false, nil
+	}
+	contained, err := filepath.Rel(resolvedRoot, resolvedTarget)
+	if err != nil || contained == ".." || strings.HasPrefix(contained, ".."+string(filepath.Separator)) {
+		return false, nil
+	}
+	targetInfo, err := os.Lstat(target)
+	if err != nil || !targetInfo.Mode().IsRegular() || targetInfo.Mode().Perm() != 0o700 {
+		return false, nil
+	}
+	if err := validateCursorPrivateTreeOwnership(target, targetInfo); err != nil {
+		return false, err
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return false, fmt.Errorf("cursor agent symlink recheck %q: %w", path, err)
+	}
+	currentTarget, err := os.Readlink(path)
+	if err != nil {
+		return false, fmt.Errorf("read cursor agent symlink during recheck %q: %w", path, err)
+	}
+	if !os.SameFile(linkInfo, current) || current.Mode()&os.ModeSymlink == 0 || currentTarget != target {
+		return false, fmt.Errorf("cursor agent symlink %q changed during cleanup", path)
+	}
+	if err := syscall.Unlink(path); err != nil {
+		return false, fmt.Errorf("unlink expected cursor agent symlink %q: %w", path, err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		if err == nil {
+			return false, fmt.Errorf("expected cursor agent symlink %q still exists after cleanup", path)
+		}
+		return false, fmt.Errorf("verify expected cursor agent symlink cleanup %q: %w", path, err)
+	}
+	return true, nil
+}
+
 func validCursorPrivateRuntimeDir(name string) bool {
 	const prefix = "private-"
 	if !strings.HasPrefix(name, prefix) {

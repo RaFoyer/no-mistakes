@@ -11,3 +11,5 @@ func validateCursorPrivateTreeOwnership(_ string, _ os.FileInfo) error { return 
 func cleanupExpectedCursorWorkerSocket(_, _ string, _ os.FileInfo) (bool, error) {
 	return false, nil
 }
+
+func cleanupExpectedCursorAgentSymlink(_, _ string) (bool, error) { return false, nil }
