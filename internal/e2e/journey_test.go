@@ -1961,9 +1961,14 @@ func assertDifferentBranchDoesNotCancelActiveRun(t *testing.T, h *Harness) {
 	fastConfig := "ignore_patterns:\n  - '*.generated.go'\n  - 'vendor/**'\ncommands:\n  test: true\n  lint: true\n"
 	h.CommitChange("different-branch-fast", ".no-mistakes.yaml", fastConfig, "configure different-branch fast checks")
 	h.PushToGate("different-branch-fast")
-	fastRun := h.WaitForRun("different-branch-fast", 60*time.Second)
-	if fastRun.Status != types.RunCompleted {
-		t.Fatalf("different-branch-fast run did not complete: status=%s error=%v", fastRun.Status, deref(fastRun.Error))
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, run := range h.Runs() {
+			if run.Branch == "different-branch-fast" {
+				t.Fatalf("different-branch-fast unexpectedly started: status=%s error=%v", run.Status, deref(run.Error))
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	slowCurrent := findRunByID(h.Runs(), slowRun.ID)
 	if slowCurrent == nil {

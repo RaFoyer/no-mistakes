@@ -35,11 +35,12 @@
 </p>
 
 `no-mistakes` puts a local git proxy in front of your real remote.
-Push to `no-mistakes` instead of `origin`, and it spins up a disposable worktree, runs an AI-driven validation pipeline, forwards the branch to the configured push target only after every check passes, and opens a clean PR automatically.
+Push to `no-mistakes` instead of `origin`, and, after shared-runtime admission, it spins up a disposable worktree, runs an AI-driven validation pipeline, forwards the branch to the configured push target only after every check passes, and opens a clean PR automatically.
+The current source-only build deliberately ships without an active coordinator, so fresh runs fail closed until that separately governed adapter exists; see the [daemon admission contract](https://kunchenguid.github.io/no-mistakes/concepts/daemon/#shared-runtime-admission).
 
 - **Non-blocking** - the pipeline runs in an isolated worktree without disrupting your work.
 - **Agent-agnostic** - `claude`, `codex`, `rovodev`, `opencode`, `pi`, `copilot`, or `acp:<target>` via `acpx`, with ordered fallbacks; every gate requires a runnable configured pipeline agent.
-- **Agent-native** - `/no-mistakes` lets your coding agent do a task and gate it, or gate existing committed work: it runs the pipeline, has the pipeline apply safe fixes, and escalates the rest to you.
+- **Agent-native** - `/no-mistakes` lets your coding agent do a task and request the gate, or gate existing committed work: once admitted, it runs the pipeline, applies safe fixes, and escalates the rest to you.
 - **Human stays in charge** - auto-fix or review findings, your call.
 - **Clean PRs by default** - push, open PR, watch CI, and auto-fix failures in one shot.
 
@@ -52,7 +53,7 @@ Full documentation: <https://kunchenguid.github.io/no-mistakes/>
             │  git push no-mistakes
             ▼
    ┌────────────────────────────────────────────────┐
-   │  disposable worktree — your work stays put     │
+   │  admission → disposable worktree                │
    │  review → test → docs → lint → push → PR → CI  │
    └────────────────────────────────────────────────┘
             │  every check green
@@ -91,7 +92,7 @@ $ git checkout my-branch
 # do some work in the branch...
 
 $ git push no-mistakes
-  * Pipeline started
+  * Local gate accepted the push; no run starts without admission
 
   Run no-mistakes to review.
 
@@ -108,10 +109,10 @@ Use `/no-mistakes` (see below).
 
 ## Three ways to trigger the gate
 
-Every change runs through the same pipeline. Pick the entry point that fits how you're working when the change is ready:
+Every admitted change runs through the same pipeline. Pick the entry point that fits how you're working when the change is ready:
 
 - **`git push no-mistakes`** - the explicit Git path. Push a committed branch to the gate remote instead of `origin`.
-- **`no-mistakes`** - the TUI. Run it after making changes (no commit needed) and a wizard walks you through creating a branch, committing, and pushing through the gate, then attaches to the run. `no-mistakes -y` does all of that automatically.
+- **`no-mistakes`** - the TUI. Run it after making changes (no commit needed) and a wizard walks you through creating a branch, committing, and pushing through the gate, then attaches when admission succeeds. `no-mistakes -y` does all of that automatically.
 - **`/no-mistakes`** - the agent skill. Tell the coding agent to do a task and gate it with `/no-mistakes <task>`, or use bare `/no-mistakes` to gate existing committed work. It runs the pipeline, has the pipeline apply safe fixes, and stops to ask you about anything that needs a human call.
 
 `no-mistakes init` installs the `/no-mistakes` skill for Claude Code and other agents. Under the hood the skill drives `no-mistakes axi`, a non-interactive TOON interface to the same approval flow.

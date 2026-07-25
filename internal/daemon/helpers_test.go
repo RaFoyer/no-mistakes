@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -12,12 +14,29 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kunchenguid/no-mistakes/internal/admission"
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/paths"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
+
+func testAdmissionCoordinator(t *testing.T) admission.RuntimeCoordinator {
+	t.Helper()
+	seed := sha256.Sum256([]byte(t.Name()))
+	private := ed25519.NewKeyFromSeed(seed[:])
+	coordinator, err := admission.NewInMemory(admission.InMemoryConfig{
+		PrivateKey: private,
+		Clock: func() time.Time {
+			return time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return coordinator
+}
 
 func TestMain(m *testing.M) {
 	switch os.Getenv("NM_DAEMON_HELPER_PROCESS") {
@@ -49,6 +68,13 @@ func TestMain(m *testing.M) {
 // startTestDaemon starts RunWithResources in a goroutine with a temp root.
 // Returns paths, db, and a cleanup function that stops the daemon.
 func startTestDaemon(t *testing.T) (*paths.Paths, *db.DB) {
+	return startTestDaemonWithOptions(t, WithAdmissionCoordinator(testAdmissionCoordinator(t)))
+}
+
+// startTestDaemonWithOptions starts an isolated daemon with explicit
+// dependencies. Passing no coordinator intentionally exercises the
+// production fail-closed default without touching any shared runtime.
+func startTestDaemonWithOptions(t *testing.T, options ...RunManagerOption) (*paths.Paths, *db.DB) {
 	t.Helper()
 
 	// Use short temp dir to avoid macOS 104-byte Unix socket path limit.
@@ -71,7 +97,7 @@ func startTestDaemon(t *testing.T) (*paths.Paths, *db.DB) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- RunWithResources(p, d)
+		errCh <- RunWithResources(p, d, options...)
 	}()
 
 	// Wait for socket to appear.
@@ -178,7 +204,7 @@ func startTestDaemonWithSteps(t *testing.T, sf StepFactory) (*paths.Paths, *db.D
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- RunWithOptions(p, d, sf)
+		errCh <- RunWithOptions(p, d, sf, WithAdmissionCoordinator(testAdmissionCoordinator(t)))
 	}()
 
 	deadline := time.Now().Add(3 * time.Second)

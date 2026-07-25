@@ -71,6 +71,12 @@ Safest local verification sequence after non-trivial changes:
 - Startup worktree cleanup is DB-aware: never remove a worktree whose run row is `pending` or `running`; `startRun` inserts the run row before creating the worktree, so a no-row directory is safe to remove immediately.
 - The user-facing model lives in `docs/src/content/docs/concepts/daemon.md`; the lock rationale lives in the `internal/daemon/lock.go` and `daemon.go` comments. Regressions: `TestAcquireSingletonLock_*`, `TestRunWithResources_SecondDaemonForSameRootFailsWithoutStealingSocket`, `TestRunWithOptions_RequiresSingletonLockBeforeRecovery`, `TestRecoverOnStartup_DoesNotDeleteActiveRunWorktree`, `TestServe_SecondListenerForLiveSocketDoesNotStealIt`, `TestDialConnectTimeoutFailsFastAndNamesSocket`, `TestIsRunningFailsFastWhenSocketAcceptsButDoesNotRespond`, `TestIsRunningSurfacesExistingDeadSocket`, `TestDaemonRunRootFromArgs_EnvDoesNotForceDaemonModeForProbes`, `TestValidateDaemonPIDFallback_RefusesToKillOwnProcess`.
 
+**Shared Runtime Admission (`internal/admission`, `internal/daemon/manager.go`)**
+
+- Every raw IPC and normal run-start path converges on `RunManager.startRun`, which obtains an authenticated `prepared -> started` admission and performs its immediate exact active-set CAS before same-branch cancellation, any run/receipt DB write, or worktree mutation. If the external coordinator is unavailable, reject the start without disturbing an active run.
+- The production default is deliberately inactive and has no local fallback. `internal/admission.InMemory` is deterministic test-only coverage; future adapter installation needs a separate governed release. Admission remains closed from `prepared -> started` until the run reaches `completed` or `failed` (or setup is `aborted`); only that terminal coordinator transition can reopen it.
+- `admission_receipts` and `no-mistakes coordinator status` are local correlation evidence only. Never use a receipt, historical snapshot hash, or local DB state as a lease, lock, recovery source, or authority to reopen admission.
+
 **Destructive Daemon Lifecycle Guard (`internal/lifecycle/guard.go`)**
 
 - `daemon stop`, `daemon restart`, and `update` refuse by default while pending/running runs exist (the daemon is machine-wide, so stopping it can fail every active pipeline), list the runs via the shared `lifecycle.ActiveRuns`/`lifecycle.RunList` helpers, and require an explicit `--force`. `update -y` answers only the different-executable prompt and deliberately does not bypass this guard.

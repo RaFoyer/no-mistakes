@@ -334,15 +334,6 @@ func TestAxiAttachCommandsIgnoreInvalidConfigWhenDaemonRunning(t *testing.T) {
 		t.Fatal("expected respond branch to be awaiting approval")
 	}
 
-	h.CommitChange("feature/abort-invalid-config", "abort.txt", "change\n", "add abort invalid config")
-	abortWorktree := h.AddWorktree("feature/abort-invalid-config")
-	if out, err := h.RunInDir(abortWorktree, "axi", "run", "--intent", axiIntent); err != nil {
-		t.Fatalf("axi run abort branch: %v\n%s", err, out)
-	}
-	if gated := waitForStepStatus(t, h, "feature/abort-invalid-config", types.StepReview, types.StepStatusAwaitingApproval, 60*time.Second); gated == nil {
-		t.Fatal("expected abort branch to be awaiting approval")
-	}
-
 	if err := os.WriteFile(filepath.Join(h.NMHome, "config.yaml"), []byte("agent: [\n"), 0o644); err != nil {
 		t.Fatalf("write invalid config: %v", err)
 	}
@@ -353,6 +344,25 @@ func TestAxiAttachCommandsIgnoreInvalidConfigWhenDaemonRunning(t *testing.T) {
 	}
 	if !strings.Contains(doneOut, "outcome: passed") {
 		t.Fatalf("axi respond with invalid config did not complete:\n%s", doneOut)
+	}
+
+	if err := os.WriteFile(filepath.Join(h.NMHome, "config.yaml"), []byte("agent: claude\n"), 0o644); err != nil {
+		t.Fatalf("restore valid config before second run: %v", err)
+	}
+
+	// Admission is global while a run is active, so create the unrelated
+	// branch only after the first run has terminalized. This keeps the test's
+	// attach/config coverage without relying on concurrent unrelated starts.
+	h.CommitChange("feature/abort-invalid-config", "abort.txt", "change\n", "add abort invalid config")
+	abortWorktree := h.AddWorktree("feature/abort-invalid-config")
+	if out, err := h.RunInDir(abortWorktree, "axi", "run", "--intent", axiIntent); err != nil {
+		t.Fatalf("axi run abort branch: %v\n%s", err, out)
+	}
+	if gated := waitForStepStatus(t, h, "feature/abort-invalid-config", types.StepReview, types.StepStatusAwaitingApproval, 60*time.Second); gated == nil {
+		t.Fatal("expected abort branch to be awaiting approval")
+	}
+	if err := os.WriteFile(filepath.Join(h.NMHome, "config.yaml"), []byte("agent: [\n"), 0o644); err != nil {
+		t.Fatalf("write invalid config for abort: %v", err)
 	}
 
 	abortOut, err := h.RunInDir(abortWorktree, "axi", "abort")

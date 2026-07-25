@@ -210,7 +210,9 @@ When a run finishes, a one-line banner appears:
 - `✗ Review failed  1.8s` (red) - names the failing step
 - `✗ Pipeline cancelled` (red) - user aborted
 
-After a failed or cancelled run, press `r` to start a rerun. The TUI switches to the new run automatically.
+After a failed or cancelled run, press `r` to request a rerun. The TUI switches
+to the new run automatically when shared-runtime admission succeeds; see
+[Daemon & Worktrees](/no-mistakes/concepts/daemon/#shared-runtime-admission).
 
 ## Detaching
 

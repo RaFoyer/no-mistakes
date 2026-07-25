@@ -7,6 +7,10 @@ description: Supported AI agents, how to pick one, and how they integrate.
 It is not runner-free.
 Every validation run requires either a supported native agent binary or `acpx` configured for an ACP target.
 The default `agent: auto` setting picks the first supported native agent available on your system.
+A runnable pipeline agent is necessary but not sufficient for a fresh run: the
+daemon must also obtain shared-runtime admission before it can cancel an active
+run or create local run state. The normal source build keeps that coordinator
+inactive; see [Daemon & Worktrees](/no-mistakes/concepts/daemon/#shared-runtime-admission).
 
 The coding agent that calls `no-mistakes axi` drives approval gates, but it does not automatically become the pipeline agent that performs review, evidence testing, documentation, combined documentation-and-lint housekeeping, or fixes.
 Those jobs run in the daemon's disposable worktree through the configured pipeline agent.

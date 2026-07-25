@@ -5,7 +5,7 @@ description: Complete reference for all no-mistakes commands and flags.
 
 ## no-mistakes
 
-Attach to the active pipeline run for the current branch when one exists. If none exists, bare `no-mistakes` can start the setup wizard to create a branch, commit changes, push through the gate, wait for the daemon to register the new run, and then attach. If the push succeeds but no run is registered, that wizard path now exits with an explicit error instead of silently falling through. By default this wizard path is interactive and only runs in a TTY session. In non-interactive contexts, bare `no-mistakes` falls back to showing the last 5 runs inline unless you pass `-y` or `--yes` to run the wizard and accept defaults automatically. When a TTY is available, `-y` keeps the wizard visible, shows a brief `waiting for run…` state after push, and auto-advances the default path; without a TTY it falls back to the headless path.
+Attach to the active pipeline run for the current branch when one exists. If none exists, bare `no-mistakes` can start the setup wizard to create a branch, commit changes, push through the gate, obtain shared-runtime admission, wait for the daemon to register the new run, and then attach. If the push succeeds but admission is unavailable or no run is registered, that wizard path exits with an explicit error instead of silently falling through. By default this wizard path is interactive and only runs in a TTY session. In non-interactive contexts, bare `no-mistakes` falls back to showing the last 5 runs inline unless you pass `-y` or `--yes` to run the wizard and accept defaults automatically. When a TTY is available, `-y` keeps the wizard visible, shows a brief `waiting for run…` state after push, and auto-advances the default path; without a TTY it falls back to the headless path. See [Daemon & Worktrees](/no-mistakes/concepts/daemon/#shared-runtime-admission) for the admission contract.
 
 ```sh
 no-mistakes
@@ -97,7 +97,9 @@ Err on the side of completeness: include the goal, important decisions and trade
 When starting a new run, `axi run` refuses the default branch and uncommitted working trees with actionable errors instead of auto-branching or auto-committing.
 Reattaching to an in-flight run does not require `--intent`.
 Reattaching to an in-flight run can proceed while the daemon is already running even if the global config file has become invalid, but starting a fresh run still requires valid global config.
-Starting a fresh run also requires a runnable effective pipeline agent.
+Starting a fresh run also requires shared-runtime admission and a runnable effective pipeline agent.
+The admission check happens before same-branch cancellation or local run, receipt, and worktree mutation.
+The normal source build's coordinator is inactive, so fresh starts fail closed; reattaching to an existing run remains a read/attach operation.
 If the configured native agent or ACP bridge is unavailable, the run fails before any pipeline step starts instead of reporting command-only validation as a passed gate.
 With `--yes`, `axi run` treats both `action: auto-fix` and `action: ask-user` findings as standing consent for the pipeline to fix them by selecting every finding, then accepts the resulting fix review.
 Gates with no findings or only `action: no-op` findings are approved as-is, and each step is fixed at most once so unresolved findings do not loop forever.
@@ -236,8 +238,8 @@ Rerun the pipeline for the current branch.
 no-mistakes rerun
 ```
 
-Starts a new pipeline run using the last-known head SHA on the current branch.
-If another run is active on that branch, rerun cancels it before starting over.
+Requests a new pipeline run using the last-known head SHA on the current branch.
+The request must first pass shared-runtime admission. If another run is active on that branch, the coordinator must authorize an exact same-branch supersession before rerun cancels it and starts over; an unavailable or stale admission leaves the active run untouched.
 Treat rerun as a between-runs action after a failed or cancelled outcome, or after you have committed a separate fix outside an active run; do not use it to bypass a gate.
 
 ## no-mistakes status
@@ -268,6 +270,16 @@ no-mistakes runs [--limit <n>]
 | `--limit` | `int` | `10`    | Maximum number of runs to display |
 
 Shows runs newest-first with branch, status (styled), short SHA, timestamp, and PR URL if set.
+
+## no-mistakes coordinator status
+
+Show read-only shared-runtime admission correlation evidence for the current repository.
+
+```sh
+no-mistakes coordinator status
+```
+
+The current source build labels the external coordinator inactive. Any listed rows are local correlation evidence for a coordinator-issued claim and hash-linked ledger entry; they are not a ledger, lease, lock, or authority to reopen admission or recover a runtime. See [Daemon & Worktrees](/no-mistakes/concepts/daemon/#shared-runtime-admission) for the contract and source-build boundary.
 
 ## no-mistakes stats
 

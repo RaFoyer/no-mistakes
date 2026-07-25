@@ -82,7 +82,7 @@ git checkout -b feature/login-fix
 git push no-mistakes
 ```
 
-The push lands in the local bare repo, the hook notifies the daemon, and the daemon starts the pipeline in a disposable worktree.
+The push lands in the local bare repo, the hook notifies the daemon, and the daemon requests shared-runtime admission before starting the pipeline in a disposable worktree. If admission is unavailable, the push can succeed without creating a run; see [Daemon & Worktrees](/no-mistakes/concepts/daemon/#shared-runtime-admission).
 
 ## 5. Watch the pipeline
 
@@ -90,7 +90,7 @@ The push lands in the local bare repo, the hook notifies the daemon, and the dae
 no-mistakes
 ```
 
-If the current branch has an active run, this attaches directly. If not, the setup wizard can walk you through creating a branch, committing, and pushing through the gate, then attach if the daemon registers the new run. By default that path is interactive in a TTY. With `no-mistakes -y`, the wizard accepts defaults automatically, stays visible and auto-advances in a TTY, and falls back to the headless path without a TTY.
+If the current branch has an active run, this attaches directly. If not, the setup wizard can walk you through creating a branch, committing, and pushing through the gate, then attach if admission succeeds and the daemon registers the new run. By default that path is interactive in a TTY. With `no-mistakes -y`, the wizard accepts defaults automatically, stays visible and auto-advances in a TTY, and falls back to the headless path without a TTY.
 
 The TUI shows each step's progress, streams agent output, and pauses for your approval when findings need attention. See [Using the TUI](/no-mistakes/guides/tui/) for keybindings and layout.
 
