@@ -39,6 +39,10 @@ export default defineConfig({
             { label: "Configuration", slug: "guides/configuration" },
             { label: "Choosing an Agent", slug: "guides/agents" },
             { label: "Provider Integration", slug: "guides/provider-integration" },
+            {
+              label: "Coordinator Provisioning",
+              slug: "guides/coordinator-provisioning",
+            },
             { label: "Setup Wizard", slug: "guides/setup-wizard" },
             { label: "Using the TUI", slug: "guides/tui" },
             { label: "Troubleshooting", slug: "guides/troubleshooting" },
