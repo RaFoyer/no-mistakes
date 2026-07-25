@@ -64,11 +64,15 @@ func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (result *Result
 	if a.homeDir == "" {
 		return nil, fmt.Errorf("cursor home directory is required; set cursor_home_dir in the global config")
 	}
-	if err := a.validatePrivateRoots(); err != nil {
+	resolvedBin, err := resolveCursorBinary(a.bin)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.validatePrivateRoots(resolvedBin); err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err := a.validatePrivateRoots(); err != nil {
+		if err := a.validatePrivateRoots(resolvedBin); err != nil {
 			cleanupErr := fmt.Errorf("cursor post-attempt private-tree validation: %w", err)
 			if retErr == nil {
 				result, retErr = nil, cleanupErr
@@ -84,10 +88,6 @@ func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (result *Result
 	if len(stdinPrompt) > cursorMaxPromptBytes {
 		return nil, fmt.Errorf("cursor prompt and schema are %d bytes; maximum is %d", len(stdinPrompt), cursorMaxPromptBytes)
 	}
-	resolvedBin, err := resolveCursorBinary(a.bin)
-	if err != nil {
-		return nil, err
-	}
 	if err := a.checkVersion(ctx, opts.CWD, resolvedBin); err != nil {
 		return nil, err
 	}
@@ -96,7 +96,7 @@ func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (result *Result
 	}
 	// The probes run under these roots too. Revalidate before model startup so
 	// an updater or token refresh cannot introduce a permissive credential file.
-	if err := a.validatePrivateRoots(); err != nil {
+	if err := a.validatePrivateRoots(resolvedBin); err != nil {
 		return nil, err
 	}
 
@@ -206,21 +206,25 @@ func cursorStdinPrompt(prompt string, schema json.RawMessage) (string, error) {
 }
 
 func validateCursorConfigDir(path string) error {
-	return validateCursorPrivateTree(path, "config directory", "isolated Cursor profile is absent; interactive login is disabled for daemon launches", false)
+	return validateCursorPrivateTree(path, "config directory", "isolated Cursor profile is absent; interactive login is disabled for daemon launches", false, "")
 }
 
-func (a *cursorAgent) validatePrivateRoots() error {
+func (a *cursorAgent) validatePrivateRoots(trustedExecutable string) error {
 	if err := validateCursorConfigDir(a.configDir); err != nil {
 		return err
 	}
-	return validateCursorHomeDir(a.homeDir)
+	return validateCursorHomeDirWithTrustedExecutable(a.homeDir, trustedExecutable)
 }
 
 func validateCursorHomeDir(path string) error {
-	return validateCursorPrivateTree(path, "home directory", "isolated Cursor credential home is absent; interactive login is disabled for daemon launches", true)
+	return validateCursorHomeDirWithTrustedExecutable(path, "")
 }
 
-func validateCursorPrivateTree(path, label, missingDetail string, cleanupRuntimeSocket bool) error {
+func validateCursorHomeDirWithTrustedExecutable(path, trustedExecutable string) error {
+	return validateCursorPrivateTree(path, "home directory", "isolated Cursor credential home is absent; interactive login is disabled for daemon launches", true, trustedExecutable)
+}
+
+func validateCursorPrivateTree(path, label, missingDetail string, cleanupRuntimeSocket bool, trustedExecutable string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("cursor %s must be an absolute path", label)
 	}
@@ -268,6 +272,15 @@ func validateCursorPrivateTree(path, label, missingDetail string, cleanupRuntime
 				}
 			}
 			return fmt.Errorf("cursor private tree entry %q must be a regular file or directory", current)
+		}
+		if cleanupRuntimeSocket && entryInfo.Mode().IsRegular() {
+			cleaned, err := cleanupExpectedCursorRuntimeExecutable(path, current, entryInfo, trustedExecutable)
+			if err != nil {
+				return err
+			}
+			if cleaned {
+				return nil
+			}
 		}
 		wantMode := os.FileMode(0o600)
 		if entryInfo.IsDir() {

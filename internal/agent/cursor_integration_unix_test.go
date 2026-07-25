@@ -550,6 +550,101 @@ func TestCursorHomeDirDoesNotRemoveAgentSymlinkToSymlinkedTarget(t *testing.T) {
 	}
 }
 
+func TestCursorHomeDirRemovesCursorExecutableMatchingTrustedBinary(t *testing.T) {
+	home := privateCursorHome(t)
+	trusted := filepath.Join(t.TempDir(), "cursor-agent")
+	body := []byte("#!/bin/sh\nprintf trusted\n")
+	if err := os.WriteFile(trusted, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runtimePath := filepath.Join(home, ".local", "bin", "cursor")
+	if err := os.MkdirAll(filepath.Dir(runtimePath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runtimePath, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := validateCursorHomeDirWithTrustedExecutable(home, trusted); err != nil {
+		t.Fatalf("validate matching runtime executable: %v", err)
+	}
+	if _, err := os.Lstat(runtimePath); !os.IsNotExist(err) {
+		t.Fatalf("matching runtime executable still exists after cleanup: %v", err)
+	}
+	if _, err := os.Stat(trusted); err != nil {
+		t.Fatalf("trusted executable changed during cleanup: %v", err)
+	}
+}
+
+func TestCursorHomeDirRejectsUntrustedRuntimeExecutables(t *testing.T) {
+	tests := []struct {
+		name     string
+		rel      string
+		mode     os.FileMode
+		hardlink bool
+	}{
+		{name: "content mismatch", rel: filepath.Join(".local", "bin", "cursor"), mode: 0o755},
+		{name: "other executable path", rel: filepath.Join(".local", "bin", "helper"), mode: 0o755},
+		{name: "unsafe mode", rel: filepath.Join(".local", "bin", "cursor"), mode: 0o775},
+		{name: "hard linked", rel: filepath.Join(".local", "bin", "cursor"), mode: 0o755, hardlink: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := privateCursorHome(t)
+			trusted := filepath.Join(t.TempDir(), "cursor-agent")
+			if err := os.WriteFile(trusted, []byte("trusted"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(home, tt.rel)
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			body := []byte("mismatch")
+			if tt.hardlink {
+				body = []byte("trusted")
+			}
+			if err := os.WriteFile(path, body, tt.mode); err != nil {
+				t.Fatal(err)
+			}
+			if tt.hardlink {
+				if err := os.Link(path, filepath.Join(home, "second-link")); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := validateCursorHomeDirWithTrustedExecutable(home, trusted); err == nil {
+				t.Fatal("expected untrusted runtime executable refusal")
+			}
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("untrusted runtime executable was removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestCursorConfigDirRejectsCursorExecutableMatchingTrustedBinary(t *testing.T) {
+	profile := privateCursorProfile(t)
+	trusted := filepath.Join(t.TempDir(), "cursor-agent")
+	body := []byte("trusted")
+	if err := os.WriteFile(trusted, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(profile, ".local", "bin", "cursor")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := validateCursorConfigDir(profile); err == nil {
+		t.Fatal("expected profile executable refusal")
+	}
+	if _, err := os.Lstat(path); err != nil {
+		t.Fatalf("profile executable was removed: %v", err)
+	}
+}
+
 func createCursorAgentRuntimeSymlink(t *testing.T, home, version string) (string, string) {
 	t.Helper()
 	target := filepath.Join(home, ".local", "share", "cursor-agent", "versions", version, "cursor-agent")

@@ -13,3 +13,7 @@ func cleanupExpectedCursorWorkerSocket(_, _ string, _ os.FileInfo) (bool, error)
 }
 
 func cleanupExpectedCursorAgentSymlink(_, _ string) (bool, error) { return false, nil }
+
+func cleanupExpectedCursorRuntimeExecutable(_, _ string, _ os.FileInfo, _ string) (bool, error) {
+	return false, nil
+}

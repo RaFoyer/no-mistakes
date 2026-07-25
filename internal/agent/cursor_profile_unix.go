@@ -3,12 +3,20 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 )
+
+// cursorAttestedRuntimeExecutableSHA256 is the metadata-only attestation for
+// Cursor's generated home/.local/bin/cursor launcher observed with the
+// supported CLI compatibility lane. Runtime errors never expose this value.
+const cursorAttestedRuntimeExecutableSHA256 = "548f4c6948758b82edadb49eee3fc0e5223e967412172a64bc0459fe807f9ddb"
 
 func validateCursorPrivateTreeOwnership(path string, info os.FileInfo) error {
 	stat, ok := info.Sys().(*syscall.Stat_t)
@@ -129,6 +137,82 @@ func cleanupExpectedCursorAgentSymlink(root, path string) (bool, error) {
 		return false, fmt.Errorf("verify expected cursor agent symlink cleanup %q: %w", path, err)
 	}
 	return true, nil
+}
+
+func cleanupExpectedCursorRuntimeExecutable(root, path string, info os.FileInfo, trustedExecutable string) (bool, error) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false, fmt.Errorf("cursor runtime executable path %q: %w", path, err)
+	}
+	if rel != filepath.Join(".local", "bin", "cursor") {
+		return false, nil
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o755 {
+		return false, nil
+	}
+	if err := validateCursorPrivateTreeOwnership(path, info); err != nil {
+		return false, err
+	}
+	actualHash, err := cursorFileSHA256(path)
+	if err != nil {
+		return false, fmt.Errorf("hash cursor runtime executable %q: %w", path, err)
+	}
+	attested := hex.EncodeToString(actualHash[:]) == cursorAttestedRuntimeExecutableSHA256
+	if trustedExecutable != "" {
+		trustedInfo, statErr := os.Lstat(trustedExecutable)
+		if statErr != nil || !trustedInfo.Mode().IsRegular() {
+			return false, fmt.Errorf("cursor trusted executable %q must be a real regular file", trustedExecutable)
+		}
+		trustedHash, hashErr := cursorFileSHA256(trustedExecutable)
+		if hashErr != nil {
+			return false, fmt.Errorf("hash cursor trusted executable %q: %w", trustedExecutable, hashErr)
+		}
+		attested = attested || actualHash == trustedHash
+	}
+	if !attested {
+		return false, nil
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return false, fmt.Errorf("cursor runtime executable recheck %q: %w", path, err)
+	}
+	currentHash, err := cursorFileSHA256(path)
+	if err != nil {
+		return false, fmt.Errorf("rehash cursor runtime executable %q: %w", path, err)
+	}
+	if !os.SameFile(info, current) || !current.Mode().IsRegular() || current.Mode().Perm() != 0o755 || currentHash != actualHash {
+		return false, fmt.Errorf("cursor runtime executable %q changed during cleanup", path)
+	}
+	if err := syscall.Unlink(path); err != nil {
+		return false, fmt.Errorf("unlink expected cursor runtime executable %q: %w", path, err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		if err == nil {
+			return false, fmt.Errorf("expected cursor runtime executable %q still exists after cleanup", path)
+		}
+		return false, fmt.Errorf("verify expected cursor runtime executable cleanup %q: %w", path, err)
+	}
+	return true, nil
+}
+
+func cursorFileSHA256(path string) ([sha256.Size]byte, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return [sha256.Size]byte{}, fmt.Errorf("open returned no file")
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return [sha256.Size]byte{}, err
+	}
+	var sum [sha256.Size]byte
+	copy(sum[:], hash.Sum(nil))
+	return sum, nil
 }
 
 func validCursorPrivateRuntimeDir(name string) bool {
