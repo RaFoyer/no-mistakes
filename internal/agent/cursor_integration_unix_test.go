@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -372,4 +373,142 @@ func TestCursorHomeDirRejectsHardLinksAndSpecialFiles(t *testing.T) {
 	if err := validateCursorHomeDir(home); err == nil || !strings.Contains(err.Error(), "regular file or directory") {
 		t.Fatalf("special-file error = %v", err)
 	}
+}
+
+func TestCursorHomeDirRemovesExpectedWorkerSocket(t *testing.T) {
+	home := privateCursorShortRoot(t, "home")
+	socket := createCursorWorkerSocket(t, home, "private-d015159", "worker.sock")
+
+	if err := validateCursorHomeDir(home); err != nil {
+		t.Fatalf("validate home with expected worker socket: %v", err)
+	}
+	if _, err := os.Lstat(socket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker socket still exists after validated cleanup: %v", err)
+	}
+	if err := validateCursorHomeDir(home); err != nil {
+		t.Fatalf("validate home after worker socket cleanup: %v", err)
+	}
+}
+
+func TestCursorRunCleansExpectedWorkerSocketCreatedDuringAttempt(t *testing.T) {
+	home := privateCursorShortRoot(t, "home")
+	profile := privateCursorProfile(t)
+	bin := writeCursorFixture(t, `
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s","model":"Cursor Grok 4.5 Medium"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s","usage":{"inputTokens":1,"outputTokens":1}}'
+`)
+	var socket string
+	a := &cursorAgent{bin: bin, configDir: profile, homeDir: home}
+	_, err := a.runOnce(context.Background(), RunOpts{
+		Prompt: "review", CWD: t.TempDir(), Purpose: "review",
+		Routing: routing.Decide(routing.Input{Harness: "cursor", Purpose: "review"}),
+		OnLifecycle: func(event LifecycleEvent) {
+			if event.Phase == LifecyclePhaseStart {
+				socket = createCursorWorkerSocket(t, home, "private-d015159", "worker.sock")
+			}
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if socket == "" {
+		t.Fatal("worker socket was not created during the model attempt")
+	}
+	if _, err := os.Lstat(socket); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("worker socket still exists after model attempt: %v", err)
+	}
+}
+
+func TestCursorHomeDirRejectsUnexpectedRuntimeSockets(t *testing.T) {
+	tests := []struct {
+		name       string
+		privateDir string
+		socketName string
+	}{
+		{name: "wrong basename", privateDir: "private-d015159", socketName: "other.sock"},
+		{name: "unbounded private id", privateDir: "private-" + strings.Repeat("a", 33), socketName: "worker.sock"},
+		{name: "invalid private id", privateDir: "private-not_ok", socketName: "worker.sock"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := privateCursorShortRoot(t, "home")
+			socket := createCursorWorkerSocket(t, home, tt.privateDir, tt.socketName)
+			err := validateCursorHomeDir(home)
+			if err == nil || !strings.Contains(err.Error(), "regular file or directory") {
+				t.Fatalf("unexpected socket error = %v, want special-file refusal", err)
+			}
+			if _, err := os.Lstat(socket); err != nil {
+				t.Fatalf("unexpected socket was removed: %v", err)
+			}
+		})
+	}
+}
+
+func TestCursorConfigDirRejectsExpectedWorkerSocketShape(t *testing.T) {
+	profile := privateCursorShortRoot(t, "profile")
+	socket := createCursorWorkerSocket(t, profile, "private-d015159", "worker.sock")
+
+	err := validateCursorConfigDir(profile)
+	if err == nil || !strings.Contains(err.Error(), "regular file or directory") {
+		t.Fatalf("profile worker socket error = %v, want special-file refusal", err)
+	}
+	if _, err := os.Lstat(socket); err != nil {
+		t.Fatalf("profile worker socket was removed: %v", err)
+	}
+}
+
+func TestCursorHomeDirDoesNotRepairCredentialFileAtWorkerSocketPath(t *testing.T) {
+	home := privateCursorHome(t)
+	privateDir := filepath.Join(home, ".cursor", "private-d015159")
+	if err := os.MkdirAll(privateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(privateDir, "worker.sock")
+	if err := os.WriteFile(path, []byte("credential-like state"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := validateCursorHomeDir(home)
+	if err == nil || !strings.Contains(err.Error(), "require 0600") {
+		t.Fatalf("credential-like file error = %v, want private-mode refusal", err)
+	}
+	if info, statErr := os.Lstat(path); statErr != nil || !info.Mode().IsRegular() {
+		t.Fatalf("credential-like file changed or removed: info=%v err=%v", info, statErr)
+	}
+}
+
+func createCursorWorkerSocket(t *testing.T, root, privateDir, name string) string {
+	t.Helper()
+	dir := filepath.Join(root, ".cursor", privateDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, name)
+	addr, err := net.ResolveUnixAddr("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.ListenUnix("unix", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func privateCursorShortRoot(t *testing.T, name string) string {
+	t.Helper()
+	parent, err := os.MkdirTemp("/tmp", "nm-cursor-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(parent) })
+	root := filepath.Join(parent, name)
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return root
 }

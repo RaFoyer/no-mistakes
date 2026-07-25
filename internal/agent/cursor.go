@@ -57,7 +57,7 @@ func (a *cursorAgent) Run(ctx context.Context, opts RunOpts) (*Result, error) {
 	})
 }
 
-func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error) {
+func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (result *Result, retErr error) {
 	if a.configDir == "" {
 		return nil, fmt.Errorf("cursor config directory is required; set cursor_config_dir in the global config")
 	}
@@ -67,6 +67,16 @@ func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	if err := a.validatePrivateRoots(); err != nil {
 		return nil, err
 	}
+	defer func() {
+		if err := a.validatePrivateRoots(); err != nil {
+			cleanupErr := fmt.Errorf("cursor post-attempt private-tree validation: %w", err)
+			if retErr == nil {
+				result, retErr = nil, cleanupErr
+				return
+			}
+			retErr = errors.Join(retErr, cleanupErr)
+		}
+	}()
 	stdinPrompt, err := cursorStdinPrompt(opts.Prompt, opts.JSONSchema)
 	if err != nil {
 		return nil, err
@@ -145,7 +155,7 @@ func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 		emitAgentExited(opts, a.Name(), pid, err)
 		return nil, err
 	}
-	result, err := finalizeCursorResult(parsed, opts.JSONSchema)
+	result, err = finalizeCursorResult(parsed, opts.JSONSchema)
 	emitAgentExited(opts, a.Name(), pid, err)
 	return result, err
 }
@@ -196,7 +206,7 @@ func cursorStdinPrompt(prompt string, schema json.RawMessage) (string, error) {
 }
 
 func validateCursorConfigDir(path string) error {
-	return validateCursorPrivateTree(path, "config directory", "isolated Cursor profile is absent; interactive login is disabled for daemon launches")
+	return validateCursorPrivateTree(path, "config directory", "isolated Cursor profile is absent; interactive login is disabled for daemon launches", false)
 }
 
 func (a *cursorAgent) validatePrivateRoots() error {
@@ -207,10 +217,10 @@ func (a *cursorAgent) validatePrivateRoots() error {
 }
 
 func validateCursorHomeDir(path string) error {
-	return validateCursorPrivateTree(path, "home directory", "isolated Cursor credential home is absent; interactive login is disabled for daemon launches")
+	return validateCursorPrivateTree(path, "home directory", "isolated Cursor credential home is absent; interactive login is disabled for daemon launches", true)
 }
 
-func validateCursorPrivateTree(path, label, missingDetail string) error {
+func validateCursorPrivateTree(path, label, missingDetail string, cleanupRuntimeSocket bool) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("cursor %s must be an absolute path", label)
 	}
@@ -239,6 +249,15 @@ func validateCursorPrivateTree(path, label, missingDetail string) error {
 			return fmt.Errorf("cursor private tree contains symlink %q", current)
 		}
 		if !entryInfo.IsDir() && !entryInfo.Mode().IsRegular() {
+			if cleanupRuntimeSocket {
+				cleaned, err := cleanupExpectedCursorWorkerSocket(path, current, entryInfo)
+				if err != nil {
+					return err
+				}
+				if cleaned {
+					return nil
+				}
+			}
 			return fmt.Errorf("cursor private tree entry %q must be a regular file or directory", current)
 		}
 		wantMode := os.FileMode(0o600)
