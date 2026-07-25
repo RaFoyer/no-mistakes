@@ -32,7 +32,31 @@ var (
 	ErrInvalidTransition      = errors.New("invalid admission transition")
 	ErrUnknownLease           = errors.New("unknown admission lease")
 	ErrInvalidLease           = errors.New("invalid admission lease")
+	ErrClaimAction            = errors.New("claim does not authorize the requested action")
+	ErrClaimIssuer            = errors.New("claim does not match the trusted coordinator identity")
 )
+
+const (
+	DefaultMaxClockSkew  = 30 * time.Second
+	CurrentPolicyVersion = "no-mistakes-admission-v2"
+)
+
+type Action string
+
+const (
+	ActionRunStart       Action = "run-start"
+	ActionSupersedeRun   Action = "same-branch-supersession"
+	ActionDaemonRecovery Action = "daemon-recovery"
+)
+
+func (a Action) Valid() bool {
+	switch a {
+	case ActionRunStart, ActionSupersedeRun, ActionDaemonRecovery:
+		return true
+	default:
+		return false
+	}
+}
 
 // ActiveRun is the exact portable representation of an active local run.
 // Historical active-set hashes are evidence only and never substitute for a
@@ -132,16 +156,22 @@ func (c Claimant) Valid() bool {
 // ClaimInput is the signed, portable admission packet. PreviousHash binds a
 // fresh claim to the coordinator ledger tip observed by its issuer.
 type ClaimInput struct {
-	Version        int           `json:"version"`
-	ClaimID        string        `json:"claim_id"`
-	Runtime        string        `json:"runtime"`
-	Claimant       Claimant      `json:"claimant"`
-	SnapshotDigest string        `json:"snapshot_digest"`
-	PreviousHash   string        `json:"previous_hash"`
-	IssuedAt       time.Time     `json:"issued_at"`
-	StartBy        time.Time     `json:"start_by"`
-	ExpiresAt      time.Time     `json:"expires_at"`
-	Supersession   *Supersession `json:"supersession,omitempty"`
+	Version            int           `json:"version"`
+	ClaimID            string        `json:"claim_id"`
+	RequestKey         string        `json:"request_key"`
+	Action             Action        `json:"action"`
+	Runtime            string        `json:"runtime"`
+	Claimant           Claimant      `json:"claimant"`
+	SnapshotDigest     string        `json:"snapshot_digest"`
+	PreconditionDigest string        `json:"precondition_digest"`
+	PolicyVersion      string        `json:"policy_version"`
+	CoordinatorID      string        `json:"coordinator_id"`
+	KeyID              string        `json:"key_id"`
+	PreviousHash       string        `json:"previous_hash"`
+	IssuedAt           time.Time     `json:"issued_at"`
+	StartBy            time.Time     `json:"start_by"`
+	ExpiresAt          time.Time     `json:"expires_at"`
+	Supersession       *Supersession `json:"supersession,omitempty"`
 }
 
 // Claim is mutable only as an untrusted transport value: every use verifies
@@ -163,7 +193,17 @@ func SignClaim(key ed25519.PrivateKey, input ClaimInput) (Claim, error) {
 	return Claim{Input: input, Signature: ed25519.Sign(key, payload)}, nil
 }
 
-func VerifyClaim(claim Claim, key ed25519.PublicKey, runtime string, claimant Claimant, now time.Time) error {
+type VerificationContext struct {
+	Runtime       string
+	Claimant      Claimant
+	Action        Action
+	CoordinatorID string
+	KeyID         string
+	Now           time.Time
+	MaxClockSkew  time.Duration
+}
+
+func VerifyClaim(claim Claim, key ed25519.PublicKey, expected VerificationContext) error {
 	if len(key) != ed25519.PublicKeySize {
 		return ErrInvalidSignature
 	}
@@ -175,14 +215,24 @@ func VerifyClaim(claim Claim, key ed25519.PublicKey, runtime string, claimant Cl
 	if !ed25519.Verify(key, payload, claim.Signature) {
 		return ErrInvalidSignature
 	}
-	if input.Runtime != runtime || input.Claimant != claimant {
+	if input.Runtime != expected.Runtime || input.Claimant != expected.Claimant {
 		return ErrClaimScope
 	}
-	now = now.UTC()
-	if input.IssuedAt.After(now) {
+	if input.Action != expected.Action {
+		return ErrClaimAction
+	}
+	if input.CoordinatorID != expected.CoordinatorID || input.KeyID != expected.KeyID {
+		return ErrClaimIssuer
+	}
+	skew := expected.MaxClockSkew
+	if skew < 0 {
 		return ErrClaimFuture
 	}
-	if !input.ExpiresAt.After(now) {
+	now := expected.Now.UTC()
+	if input.IssuedAt.After(now.Add(skew)) {
+		return ErrClaimFuture
+	}
+	if !input.ExpiresAt.After(now.Add(-skew)) {
 		return ErrClaimExpired
 	}
 	return nil
@@ -190,13 +240,16 @@ func VerifyClaim(claim Claim, key ed25519.PublicKey, runtime string, claimant Cl
 
 func normalizeClaimInput(input ClaimInput) (ClaimInput, error) {
 	if input.Version == 0 {
-		input.Version = 1
+		input.Version = 2
 	}
 	input.IssuedAt = input.IssuedAt.UTC()
 	input.StartBy = input.StartBy.UTC()
 	input.ExpiresAt = input.ExpiresAt.UTC()
-	if input.Version != 1 || strings.TrimSpace(input.ClaimID) == "" || strings.TrimSpace(input.Runtime) == "" || !input.Claimant.Valid() || strings.TrimSpace(input.SnapshotDigest) == "" || input.IssuedAt.IsZero() || input.StartBy.IsZero() || input.ExpiresAt.IsZero() || !input.StartBy.After(input.IssuedAt) || !input.ExpiresAt.After(input.StartBy) || (input.Supersession != nil && !input.Supersession.valid()) {
+	if input.Version != 2 || strings.TrimSpace(input.ClaimID) == "" || strings.TrimSpace(input.RequestKey) == "" || !input.Action.Valid() || strings.TrimSpace(input.Runtime) == "" || !input.Claimant.Valid() || strings.TrimSpace(input.SnapshotDigest) == "" || strings.TrimSpace(input.PreconditionDigest) == "" || strings.TrimSpace(input.PolicyVersion) == "" || strings.TrimSpace(input.CoordinatorID) == "" || strings.TrimSpace(input.KeyID) == "" || input.IssuedAt.IsZero() || input.StartBy.IsZero() || input.ExpiresAt.IsZero() || !input.StartBy.After(input.IssuedAt) || !input.ExpiresAt.After(input.StartBy) || (input.Supersession != nil && !input.Supersession.valid()) {
 		return ClaimInput{}, fmt.Errorf("incomplete claim packet")
+	}
+	if (input.Action == ActionSupersedeRun) != (input.Supersession != nil) {
+		return ClaimInput{}, fmt.Errorf("action and supersession disagree")
 	}
 	if input.Supersession != nil {
 		supersession := *input.Supersession
@@ -206,10 +259,43 @@ func normalizeClaimInput(input ClaimInput) (ClaimInput, error) {
 }
 
 type Request struct {
-	Runtime      string
-	Claimant     Claimant
-	Snapshot     Snapshot
-	Supersession *Supersession
+	Runtime            string
+	Claimant           Claimant
+	Snapshot           Snapshot
+	Supersession       *Supersession
+	Action             Action
+	PreconditionDigest string
+	PolicyVersion      string
+	RequestKey         string
+}
+
+func normalizeRequest(request Request) (Request, error) {
+	if err := request.Snapshot.Validate(); err != nil || request.Runtime == "" || !request.Claimant.Valid() || request.Snapshot.Runtime != request.Runtime {
+		return Request{}, ErrClaimScope
+	}
+	if request.Supersession != nil {
+		if err := request.Supersession.validate(request.Snapshot); err != nil {
+			return Request{}, err
+		}
+		supersession := *request.Supersession
+		request.Supersession = &supersession
+	}
+	if request.Action == "" {
+		request.Action = ActionRunStart
+		if request.Supersession != nil {
+			request.Action = ActionSupersedeRun
+		}
+	}
+	if request.PreconditionDigest == "" {
+		request.PreconditionDigest = request.Snapshot.Digest
+	}
+	if request.PolicyVersion == "" {
+		request.PolicyVersion = CurrentPolicyVersion
+	}
+	if !request.Action.Valid() || request.PreconditionDigest == "" || request.PolicyVersion == "" || (request.Action == ActionSupersedeRun) != (request.Supersession != nil) {
+		return Request{}, ErrClaimAction
+	}
+	return request, nil
 }
 
 type State string
@@ -225,33 +311,43 @@ const (
 // Lease is a bounded, immutable coordinator-issued token. Its ledger anchor
 // lets consumers correlate a run without making the local copy authoritative.
 type Lease struct {
-	ClaimID      string
-	LeaseID      string
-	Runtime      string
-	Claimant     Claimant
-	SnapshotHash string
-	Generation   uint64
-	IssuedAt     time.Time
-	StartBy      time.Time
-	ExpiresAt    time.Time
-	LedgerSeq    uint64
-	LedgerHash   string
-	Supersession *Supersession
+	ClaimID            string
+	RequestKey         string
+	LeaseID            string
+	Action             Action
+	Runtime            string
+	Claimant           Claimant
+	SnapshotHash       string
+	PreconditionDigest string
+	PolicyVersion      string
+	CoordinatorID      string
+	KeyID              string
+	Generation         uint64
+	IssuedAt           time.Time
+	StartBy            time.Time
+	ExpiresAt          time.Time
+	LedgerSeq          uint64
+	LedgerHash         string
+	Supersession       *Supersession
 }
 
 func (l Lease) Immutable() bool {
-	return l.ClaimID != "" && l.LeaseID != "" && l.Runtime != "" && l.Claimant.Valid() && l.SnapshotHash != "" && l.Generation > 0 && !l.IssuedAt.IsZero() && l.StartBy.After(l.IssuedAt) && l.ExpiresAt.After(l.StartBy) && l.LedgerSeq > 0 && l.LedgerHash != "" && (l.Supersession == nil || l.Supersession.valid())
+	return l.ClaimID != "" && l.RequestKey != "" && l.LeaseID != "" && l.Action.Valid() && l.Runtime != "" && l.Claimant.Valid() && l.SnapshotHash != "" && l.PreconditionDigest != "" && l.PolicyVersion != "" && l.CoordinatorID != "" && l.KeyID != "" && l.Generation > 0 && !l.IssuedAt.IsZero() && l.StartBy.After(l.IssuedAt) && l.ExpiresAt.After(l.StartBy) && l.LedgerSeq > 0 && l.LedgerHash != "" && (l.Supersession == nil || l.Supersession.valid()) && ((l.Action == ActionSupersedeRun) == (l.Supersession != nil))
 }
 
 func (l Lease) ValidateFor(claim Claim, request Request) error {
-	if !l.Immutable() || request.Runtime == "" || !request.Claimant.Valid() || request.Snapshot.Validate() != nil || request.Snapshot.Runtime != request.Runtime {
-		return ErrInvalidLease
-	}
-	if request.Supersession != nil && request.Supersession.validate(request.Snapshot) != nil {
+	request, err := normalizeRequest(request)
+	if err != nil || !l.Immutable() {
 		return ErrInvalidLease
 	}
 	input := claim.Input
-	if input.ClaimID != l.ClaimID || input.Runtime != request.Runtime || input.Runtime != l.Runtime || input.Claimant != request.Claimant || input.Claimant != l.Claimant || input.SnapshotDigest != request.Snapshot.Digest || input.SnapshotDigest != l.SnapshotHash || !input.IssuedAt.Equal(l.IssuedAt) || !input.StartBy.Equal(l.StartBy) || !input.ExpiresAt.Equal(l.ExpiresAt) || !sameSupersession(input.Supersession, request.Supersession) || !sameSupersession(input.Supersession, l.Supersession) {
+	// Legacy callers that have not yet adopted caller-stable request keys can
+	// still validate the coordinator-issued identity. Production adapters must
+	// supply RequestKey before Acquire to gain retry reconciliation semantics.
+	if request.RequestKey == "" {
+		request.RequestKey = input.RequestKey
+	}
+	if input.ClaimID != l.ClaimID || input.RequestKey != request.RequestKey || input.RequestKey != l.RequestKey || input.Action != request.Action || input.Action != l.Action || input.Runtime != request.Runtime || input.Runtime != l.Runtime || input.Claimant != request.Claimant || input.Claimant != l.Claimant || input.SnapshotDigest != request.Snapshot.Digest || input.SnapshotDigest != l.SnapshotHash || input.PreconditionDigest != request.PreconditionDigest || input.PreconditionDigest != l.PreconditionDigest || input.PolicyVersion != request.PolicyVersion || input.PolicyVersion != l.PolicyVersion || input.CoordinatorID != l.CoordinatorID || input.KeyID != l.KeyID || !input.IssuedAt.Equal(l.IssuedAt) || !input.StartBy.Equal(l.StartBy) || !input.ExpiresAt.Equal(l.ExpiresAt) || !sameSupersession(input.Supersession, request.Supersession) || !sameSupersession(input.Supersession, l.Supersession) {
 		return ErrInvalidLease
 	}
 	return nil
@@ -265,17 +361,25 @@ func sameSupersession(left, right *Supersession) bool {
 }
 
 type LedgerEntry struct {
-	Sequence       uint64    `json:"sequence"`
-	PriorHash      string    `json:"prior_hash"`
-	Hash           string    `json:"hash"`
-	ClaimID        string    `json:"claim_id"`
-	LeaseID        string    `json:"lease_id"`
-	Runtime        string    `json:"runtime"`
-	Claimant       Claimant  `json:"claimant"`
-	SnapshotHash   string    `json:"snapshot_hash"`
-	State          State     `json:"state"`
-	EvidenceDigest string    `json:"evidence_digest,omitempty"`
-	At             time.Time `json:"at"`
+	Sequence           uint64        `json:"sequence"`
+	PriorHash          string        `json:"prior_hash"`
+	Hash               string        `json:"hash"`
+	ClaimID            string        `json:"claim_id"`
+	RequestKey         string        `json:"request_key"`
+	LeaseID            string        `json:"lease_id"`
+	Action             Action        `json:"action"`
+	Runtime            string        `json:"runtime"`
+	Claimant           Claimant      `json:"claimant"`
+	SnapshotHash       string        `json:"snapshot_hash"`
+	PreconditionDigest string        `json:"precondition_digest"`
+	PolicyVersion      string        `json:"policy_version"`
+	CoordinatorID      string        `json:"coordinator_id"`
+	KeyID              string        `json:"key_id"`
+	Generation         uint64        `json:"generation"`
+	Supersession       *Supersession `json:"supersession,omitempty"`
+	State              State         `json:"state"`
+	EvidenceDigest     string        `json:"evidence_digest,omitempty"`
+	At                 time.Time     `json:"at"`
 }
 
 func ledgerHash(entry LedgerEntry) string {
@@ -290,27 +394,47 @@ func ValidateLedger(entries []LedgerEntry) error {
 	prior := ""
 	states := make(map[string]State, len(entries))
 	claimLeases := make(map[string]string, len(entries))
+	requestLeases := make(map[string]string, len(entries))
 	type leaseIdentity struct {
-		claimID      string
-		claimant     Claimant
-		snapshotHash string
+		claimID            string
+		requestKey         string
+		action             Action
+		claimant           Claimant
+		snapshotHash       string
+		preconditionDigest string
+		policyVersion      string
+		coordinatorID      string
+		keyID              string
+		generation         uint64
+		supersession       string
 	}
 	identities := make(map[string]leaseIdentity, len(entries))
+	runtimeGenerations := make(map[string]uint64)
 	for index, entry := range entries {
 		if entry.Sequence != uint64(index+1) || entry.PriorHash != prior || entry.Hash != ledgerHash(entry) {
 			return fmt.Errorf("ledger entry %d is not hash-linked", index+1)
 		}
-		if entry.ClaimID == "" || entry.LeaseID == "" || strings.TrimSpace(entry.Runtime) == "" || !entry.Claimant.Valid() || entry.SnapshotHash == "" || entry.At.IsZero() {
+		if entry.ClaimID == "" || entry.RequestKey == "" || entry.LeaseID == "" || !entry.Action.Valid() || strings.TrimSpace(entry.Runtime) == "" || !entry.Claimant.Valid() || entry.SnapshotHash == "" || entry.PreconditionDigest == "" || entry.PolicyVersion == "" || entry.CoordinatorID == "" || entry.KeyID == "" || entry.Generation == 0 || entry.At.IsZero() {
 			return fmt.Errorf("ledger entry %d is incomplete", index+1)
+		}
+		if (entry.Action == ActionSupersedeRun) != (entry.Supersession != nil) || (entry.Supersession != nil && !entry.Supersession.valid()) {
+			return fmt.Errorf("ledger entry %d has inconsistent action scope: %w", index+1, ErrInvalidTransition)
 		}
 		key := entry.Runtime + "\x00" + entry.LeaseID
 		if leaseKey, claimed := claimLeases[entry.ClaimID]; claimed && leaseKey != key {
 			return fmt.Errorf("ledger entry %d reuses claim: %w", index+1, ErrClaimReplay)
 		}
+		if leaseKey, requested := requestLeases[entry.RequestKey]; requested && leaseKey != key {
+			return fmt.Errorf("ledger entry %d reuses request key: %w", index+1, ErrClaimReplay)
+		}
 		state, seen := states[key]
-		identity := leaseIdentity{claimID: entry.ClaimID, claimant: entry.Claimant, snapshotHash: entry.SnapshotHash}
+		supersessionJSON, _ := json.Marshal(entry.Supersession)
+		identity := leaseIdentity{claimID: entry.ClaimID, requestKey: entry.RequestKey, action: entry.Action, claimant: entry.Claimant, snapshotHash: entry.SnapshotHash, preconditionDigest: entry.PreconditionDigest, policyVersion: entry.PolicyVersion, coordinatorID: entry.CoordinatorID, keyID: entry.KeyID, generation: entry.Generation, supersession: string(supersessionJSON)}
 		if priorIdentity, recorded := identities[key]; recorded && priorIdentity != identity {
 			return fmt.Errorf("ledger entry %d changes immutable lease fields: %w", index+1, ErrInvalidTransition)
+		}
+		if !seen && entry.Generation != runtimeGenerations[entry.Runtime]+1 {
+			return fmt.Errorf("ledger entry %d changes runtime generation: %w", index+1, ErrInvalidTransition)
 		}
 		valid := (!seen && entry.State == StatePrepared) ||
 			(state == StatePrepared && (entry.State == StateStarted || entry.State == StateAborted)) ||
@@ -319,7 +443,11 @@ func ValidateLedger(entries []LedgerEntry) error {
 			return fmt.Errorf("ledger entry %d: %w", index+1, ErrInvalidTransition)
 		}
 		identities[key] = identity
+		if !seen {
+			runtimeGenerations[entry.Runtime] = entry.Generation
+		}
 		claimLeases[entry.ClaimID] = key
+		requestLeases[entry.RequestKey] = key
 		states[key] = entry.State
 		prior = entry.Hash
 	}

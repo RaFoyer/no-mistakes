@@ -13,11 +13,14 @@ import (
 // InMemoryConfig configures deterministic, local adversarial test doubles.
 // It is never a production configuration surface.
 type InMemoryConfig struct {
-	PrivateKey  ed25519.PrivateKey
-	Clock       func() time.Time
-	NextID      func() string
-	StartWindow time.Duration
-	LeaseWindow time.Duration
+	PrivateKey    ed25519.PrivateKey
+	Clock         func() time.Time
+	NextID        func() string
+	StartWindow   time.Duration
+	LeaseWindow   time.Duration
+	CoordinatorID string
+	KeyID         string
+	MaxClockSkew  time.Duration
 }
 
 type InMemory struct {
@@ -27,6 +30,8 @@ type InMemory struct {
 	clock                    func() time.Time
 	nextID                   func() string
 	startWindow, leaseWindow time.Duration
+	coordinatorID, keyID     string
+	maxClockSkew             time.Duration
 	runtimes                 map[string]*runtimeState
 }
 
@@ -35,6 +40,7 @@ type runtimeState struct {
 	generation uint64
 	entries    []LedgerEntry
 	claims     map[string]State
+	requests   map[string]string
 	leases     map[string]Lease
 }
 
@@ -54,15 +60,27 @@ func NewInMemory(config InMemoryConfig) (*InMemory, error) {
 	if config.LeaseWindow <= config.StartWindow {
 		config.LeaseWindow = 2 * time.Minute
 	}
+	if config.CoordinatorID == "" {
+		config.CoordinatorID = "test-fleet-coordinator"
+	}
+	if config.KeyID == "" {
+		config.KeyID = "test-ed25519-key-v1"
+	}
+	if config.MaxClockSkew == 0 {
+		config.MaxClockSkew = DefaultMaxClockSkew
+	}
 	public := config.PrivateKey.Public().(ed25519.PublicKey)
 	return &InMemory{
-		privateKey:  append(ed25519.PrivateKey(nil), config.PrivateKey...),
-		publicKey:   append(ed25519.PublicKey(nil), public...),
-		clock:       config.Clock,
-		nextID:      config.NextID,
-		startWindow: config.StartWindow,
-		leaseWindow: config.LeaseWindow,
-		runtimes:    make(map[string]*runtimeState),
+		privateKey:    append(ed25519.PrivateKey(nil), config.PrivateKey...),
+		publicKey:     append(ed25519.PublicKey(nil), public...),
+		clock:         config.Clock,
+		nextID:        config.NextID,
+		startWindow:   config.StartWindow,
+		leaseWindow:   config.LeaseWindow,
+		coordinatorID: config.CoordinatorID,
+		keyID:         config.KeyID,
+		maxClockSkew:  config.MaxClockSkew,
+		runtimes:      make(map[string]*runtimeState),
 	}, nil
 }
 
@@ -79,7 +97,7 @@ func (c *InMemory) now() time.Time { return c.clock().UTC() }
 func (c *InMemory) runtime(name string) *runtimeState {
 	state := c.runtimes[name]
 	if state == nil {
-		state = &runtimeState{claims: make(map[string]State), leases: make(map[string]Lease)}
+		state = &runtimeState{claims: make(map[string]State), requests: make(map[string]string), leases: make(map[string]Lease)}
 		c.runtimes[name] = state
 	}
 	return state
@@ -89,16 +107,15 @@ func (c *InMemory) Acquire(ctx context.Context, request Request) (Claim, error) 
 	if err := ctx.Err(); err != nil {
 		return Claim{}, err
 	}
-	if err := request.Snapshot.Validate(); err != nil || request.Runtime == "" || !request.Claimant.Valid() || request.Snapshot.Runtime != request.Runtime {
-		return Claim{}, ErrClaimScope
-	}
-	if request.Supersession != nil {
-		if err := request.Supersession.validate(request.Snapshot); err != nil {
-			return Claim{}, err
-		}
+	request, err := normalizeRequest(request)
+	if err != nil {
+		return Claim{}, err
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if request.RequestKey == "" {
+		request.RequestKey = c.nextID()
+	}
 	state := c.runtime(request.Runtime)
 	if state.closed && (request.Supersession == nil || !canSupersede(state)) {
 		return Claim{}, ErrAdmissionClosed
@@ -109,15 +126,21 @@ func (c *InMemory) Acquire(ctx context.Context, request Request) (Claim, error) 
 	}
 	now := c.now()
 	return SignClaim(c.privateKey, ClaimInput{
-		ClaimID:        c.nextID(),
-		Runtime:        request.Runtime,
-		Claimant:       request.Claimant,
-		SnapshotDigest: request.Snapshot.Digest,
-		PreviousHash:   previous,
-		IssuedAt:       now,
-		StartBy:        now.Add(c.startWindow),
-		ExpiresAt:      now.Add(c.leaseWindow),
-		Supersession:   request.Supersession,
+		ClaimID:            c.nextID(),
+		RequestKey:         request.RequestKey,
+		Action:             request.Action,
+		Runtime:            request.Runtime,
+		Claimant:           request.Claimant,
+		SnapshotDigest:     request.Snapshot.Digest,
+		PreconditionDigest: request.PreconditionDigest,
+		PolicyVersion:      request.PolicyVersion,
+		CoordinatorID:      c.coordinatorID,
+		KeyID:              c.keyID,
+		PreviousHash:       previous,
+		IssuedAt:           now,
+		StartBy:            now.Add(c.startWindow),
+		ExpiresAt:          now.Add(c.leaseWindow),
+		Supersession:       request.Supersession,
 	})
 }
 
@@ -131,7 +154,7 @@ func (c *InMemory) Prepare(ctx context.Context, claim Claim, snapshot Snapshot) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	input := claim.Input
-	if err := VerifyClaim(claim, c.publicKey, snapshot.Runtime, input.Claimant, c.now()); err != nil {
+	if err := VerifyClaim(claim, c.publicKey, VerificationContext{Runtime: snapshot.Runtime, Claimant: input.Claimant, Action: input.Action, CoordinatorID: c.coordinatorID, KeyID: c.keyID, Now: c.now(), MaxClockSkew: c.maxClockSkew}); err != nil {
 		return Lease{}, err
 	}
 	if input.SnapshotDigest != snapshot.Digest {
@@ -152,6 +175,9 @@ func (c *InMemory) Prepare(ctx context.Context, claim Claim, snapshot Snapshot) 
 	if _, used := state.claims[input.ClaimID]; used {
 		return Lease{}, ErrClaimReplay
 	}
+	if claimID, used := state.requests[input.RequestKey]; used && claimID != input.ClaimID {
+		return Lease{}, ErrClaimReplay
+	}
 	previous := ""
 	if len(state.entries) != 0 {
 		previous = state.entries[len(state.entries)-1].Hash
@@ -166,20 +192,27 @@ func (c *InMemory) Prepare(ctx context.Context, claim Claim, snapshot Snapshot) 
 	state.closed = true
 	state.generation++
 	lease := Lease{
-		ClaimID:      input.ClaimID,
-		LeaseID:      leaseID,
-		Runtime:      input.Runtime,
-		Claimant:     input.Claimant,
-		SnapshotHash: input.SnapshotDigest,
-		Generation:   state.generation,
-		IssuedAt:     input.IssuedAt,
-		StartBy:      input.StartBy,
-		ExpiresAt:    input.ExpiresAt,
-		Supersession: cloneSupersession(input.Supersession),
+		ClaimID:            input.ClaimID,
+		RequestKey:         input.RequestKey,
+		LeaseID:            leaseID,
+		Action:             input.Action,
+		Runtime:            input.Runtime,
+		Claimant:           input.Claimant,
+		SnapshotHash:       input.SnapshotDigest,
+		PreconditionDigest: input.PreconditionDigest,
+		PolicyVersion:      input.PolicyVersion,
+		CoordinatorID:      input.CoordinatorID,
+		KeyID:              input.KeyID,
+		Generation:         state.generation,
+		IssuedAt:           input.IssuedAt,
+		StartBy:            input.StartBy,
+		ExpiresAt:          input.ExpiresAt,
+		Supersession:       cloneSupersession(input.Supersession),
 	}
 	entry := c.append(state, lease, StatePrepared, "")
 	lease.LedgerSeq, lease.LedgerHash = entry.Sequence, entry.Hash
 	state.claims[lease.ClaimID] = StatePrepared
+	state.requests[lease.RequestKey] = lease.ClaimID
 	storedLease := lease
 	storedLease.Supersession = cloneSupersession(lease.Supersession)
 	state.leases[lease.LeaseID] = storedLease
@@ -299,7 +332,7 @@ func cloneSupersession(value *Supersession) *Supersession {
 }
 
 func sameLease(left, right Lease) bool {
-	return left.ClaimID == right.ClaimID && left.LeaseID == right.LeaseID && left.Runtime == right.Runtime && left.Claimant == right.Claimant && left.SnapshotHash == right.SnapshotHash && left.Generation == right.Generation && left.IssuedAt.Equal(right.IssuedAt) && left.StartBy.Equal(right.StartBy) && left.ExpiresAt.Equal(right.ExpiresAt) && left.LedgerSeq == right.LedgerSeq && left.LedgerHash == right.LedgerHash && sameSupersession(left.Supersession, right.Supersession)
+	return left.ClaimID == right.ClaimID && left.RequestKey == right.RequestKey && left.LeaseID == right.LeaseID && left.Action == right.Action && left.Runtime == right.Runtime && left.Claimant == right.Claimant && left.SnapshotHash == right.SnapshotHash && left.PreconditionDigest == right.PreconditionDigest && left.PolicyVersion == right.PolicyVersion && left.CoordinatorID == right.CoordinatorID && left.KeyID == right.KeyID && left.Generation == right.Generation && left.IssuedAt.Equal(right.IssuedAt) && left.StartBy.Equal(right.StartBy) && left.ExpiresAt.Equal(right.ExpiresAt) && left.LedgerSeq == right.LedgerSeq && left.LedgerHash == right.LedgerHash && sameSupersession(left.Supersession, right.Supersession)
 }
 
 func (c *InMemory) prepared(lease Lease) (*runtimeState, Lease, error) {
@@ -328,16 +361,24 @@ func (c *InMemory) append(state *runtimeState, lease Lease, transition State, ev
 		evidenceDigest = hex.EncodeToString(sum[:])
 	}
 	entry := LedgerEntry{
-		Sequence:       uint64(len(state.entries) + 1),
-		PriorHash:      previous,
-		ClaimID:        lease.ClaimID,
-		LeaseID:        lease.LeaseID,
-		Runtime:        lease.Runtime,
-		Claimant:       lease.Claimant,
-		SnapshotHash:   lease.SnapshotHash,
-		State:          transition,
-		EvidenceDigest: evidenceDigest,
-		At:             c.now(),
+		Sequence:           uint64(len(state.entries) + 1),
+		PriorHash:          previous,
+		ClaimID:            lease.ClaimID,
+		RequestKey:         lease.RequestKey,
+		LeaseID:            lease.LeaseID,
+		Action:             lease.Action,
+		Runtime:            lease.Runtime,
+		Claimant:           lease.Claimant,
+		SnapshotHash:       lease.SnapshotHash,
+		PreconditionDigest: lease.PreconditionDigest,
+		PolicyVersion:      lease.PolicyVersion,
+		CoordinatorID:      lease.CoordinatorID,
+		KeyID:              lease.KeyID,
+		Generation:         lease.Generation,
+		Supersession:       cloneSupersession(lease.Supersession),
+		State:              transition,
+		EvidenceDigest:     evidenceDigest,
+		At:                 c.now(),
 	}
 	entry.Hash = ledgerHash(entry)
 	state.entries = append(state.entries, entry)

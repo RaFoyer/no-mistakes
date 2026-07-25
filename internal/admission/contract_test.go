@@ -12,6 +12,24 @@ import (
 
 var testClaimant = Claimant{Kind: "firstmate-manager", ID: "q9"}
 
+const (
+	testCoordinatorID = "test-fleet-coordinator"
+	testKeyID         = "test-ed25519-key-v1"
+	testPolicyVersion = "test-policy-v1"
+)
+
+func testVerification(input ClaimInput, now time.Time) VerificationContext {
+	return VerificationContext{
+		Runtime:       input.Runtime,
+		Claimant:      input.Claimant,
+		Action:        input.Action,
+		CoordinatorID: input.CoordinatorID,
+		KeyID:         input.KeyID,
+		Now:           now,
+		MaxClockSkew:  DefaultMaxClockSkew,
+	}
+}
+
 func testSigningKey() ed25519.PrivateKey {
 	seed := sha256.Sum256([]byte("no-mistakes shared-runtime admission test signer"))
 	return ed25519.NewKeyFromSeed(seed[:])
@@ -51,17 +69,25 @@ func TestClaimAuthenticationRejectsForgeryFutureAndExpiry(t *testing.T) {
 	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
 	key := testSigningKey()
 	snapshot := testSnapshot()
-	input := ClaimInput{ClaimID: "claim-a", Runtime: snapshot.Runtime, Claimant: testClaimant, SnapshotDigest: snapshot.Digest, IssuedAt: now, StartBy: now.Add(time.Second), ExpiresAt: now.Add(time.Minute)}
+	input := ClaimInput{
+		ClaimID: "claim-a", RequestKey: "request-a", Action: ActionRunStart,
+		Runtime: snapshot.Runtime, Claimant: testClaimant, SnapshotDigest: snapshot.Digest,
+		PreconditionDigest: snapshot.Digest, PolicyVersion: testPolicyVersion,
+		CoordinatorID: testCoordinatorID, KeyID: testKeyID,
+		IssuedAt: now, StartBy: now.Add(time.Second), ExpiresAt: now.Add(time.Minute),
+	}
 	claim, err := SignClaim(key, input)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), input.Runtime, input.Claimant, now); err != nil {
+	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), testVerification(input, now)); err != nil {
 		t.Fatalf("verify valid claim: %v", err)
 	}
 	supersession := &Supersession{Target: snapshot.Runs[0]}
 	supersedingInput := input
 	supersedingInput.ClaimID = "claim-superseding"
+	supersedingInput.RequestKey = "request-superseding"
+	supersedingInput.Action = ActionSupersedeRun
 	supersedingInput.Supersession = supersession
 	supersedingClaim, err := SignClaim(key, supersedingInput)
 	if err != nil {
@@ -69,32 +95,116 @@ func TestClaimAuthenticationRejectsForgeryFutureAndExpiry(t *testing.T) {
 	}
 	tamperedSupersedingClaim := supersedingClaim
 	tamperedSupersedingClaim.Input.Supersession = &Supersession{Target: ActiveRun{ID: "run-a", RepoID: "repo-a", Branch: "feature/other", HeadSHA: "aaaaaaaa", Status: "running"}}
-	if err := VerifyClaim(tamperedSupersedingClaim, key.Public().(ed25519.PublicKey), input.Runtime, input.Claimant, now); !errors.Is(err, ErrInvalidSignature) {
+	if err := VerifyClaim(tamperedSupersedingClaim, key.Public().(ed25519.PublicKey), testVerification(supersedingInput, now)); !errors.Is(err, ErrInvalidSignature) {
 		t.Fatalf("tampered supersession error = %v, want %v", err, ErrInvalidSignature)
 	}
 	forged := claim
 	forged.Signature = append([]byte(nil), claim.Signature...)
 	forged.Signature[0] ^= 0xff
-	if err := VerifyClaim(forged, key.Public().(ed25519.PublicKey), input.Runtime, input.Claimant, now); !errors.Is(err, ErrInvalidSignature) {
+	if err := VerifyClaim(forged, key.Public().(ed25519.PublicKey), testVerification(input, now)); !errors.Is(err, ErrInvalidSignature) {
 		t.Fatalf("forged claim error = %v, want %v", err, ErrInvalidSignature)
 	}
 	futureInput := input
 	futureInput.ClaimID = "claim-future"
-	futureInput.IssuedAt = now.Add(time.Second)
-	futureInput.StartBy = now.Add(2 * time.Second)
-	futureInput.ExpiresAt = now.Add(time.Minute)
+	futureInput.RequestKey = "request-future"
+	futureInput.IssuedAt = now.Add(DefaultMaxClockSkew + time.Second)
+	futureInput.StartBy = futureInput.IssuedAt.Add(time.Second)
+	futureInput.ExpiresAt = futureInput.StartBy.Add(time.Minute)
 	future, err := SignClaim(key, futureInput)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := VerifyClaim(future, key.Public().(ed25519.PublicKey), input.Runtime, input.Claimant, now); !errors.Is(err, ErrClaimFuture) {
+	if err := VerifyClaim(future, key.Public().(ed25519.PublicKey), testVerification(futureInput, now)); !errors.Is(err, ErrClaimFuture) {
 		t.Fatalf("future claim error = %v, want %v", err, ErrClaimFuture)
 	}
-	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), input.Runtime, input.Claimant, now.Add(time.Minute)); !errors.Is(err, ErrClaimExpired) {
+	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), testVerification(input, now.Add(2*time.Minute))); !errors.Is(err, ErrClaimExpired) {
 		t.Fatalf("expired claim error = %v, want %v", err, ErrClaimExpired)
 	}
-	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), input.Runtime, Claimant{Kind: testClaimant.Kind, ID: "other"}, now); !errors.Is(err, ErrClaimScope) {
+	foreign := testVerification(input, now)
+	foreign.Claimant = Claimant{Kind: testClaimant.Kind, ID: "other"}
+	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), foreign); !errors.Is(err, ErrClaimScope) {
 		t.Fatalf("foreign claimant error = %v, want %v", err, ErrClaimScope)
+	}
+}
+
+func TestClaimAuthenticationBindsActionIssuerPolicyAndPrecondition(t *testing.T) {
+	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	key := testSigningKey()
+	snapshot := testSnapshot()
+	input := ClaimInput{
+		ClaimID: "claim-bound", RequestKey: "request-bound", Action: ActionDaemonRecovery,
+		Runtime: snapshot.Runtime, Claimant: testClaimant, SnapshotDigest: snapshot.Digest,
+		PreconditionDigest: "recovery-precondition-v1", PolicyVersion: "recovery-policy-v3",
+		CoordinatorID: "fleet-coordinator-7bef4abe76e2", KeyID: "gcp-kms-key-v1",
+		IssuedAt: now, StartBy: now.Add(time.Minute), ExpiresAt: now.Add(5 * time.Minute),
+	}
+	claim, err := SignClaim(key, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := testVerification(input, now)
+	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), expected); err != nil {
+		t.Fatalf("verify valid recovery claim: %v", err)
+	}
+
+	wrongAction := expected
+	wrongAction.Action = ActionRunStart
+	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), wrongAction); !errors.Is(err, ErrClaimAction) {
+		t.Fatalf("wrong action error = %v, want %v", err, ErrClaimAction)
+	}
+	wrongCoordinator := expected
+	wrongCoordinator.CoordinatorID = "other-coordinator"
+	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), wrongCoordinator); !errors.Is(err, ErrClaimIssuer) {
+		t.Fatalf("wrong coordinator error = %v, want %v", err, ErrClaimIssuer)
+	}
+	wrongKeyID := expected
+	wrongKeyID.KeyID = "other-key"
+	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), wrongKeyID); !errors.Is(err, ErrClaimIssuer) {
+		t.Fatalf("wrong key ID error = %v, want %v", err, ErrClaimIssuer)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*ClaimInput)
+	}{
+		{name: "action", mutate: func(value *ClaimInput) { value.Action = ActionRunStart }},
+		{name: "request key", mutate: func(value *ClaimInput) { value.RequestKey = "other-request" }},
+		{name: "precondition", mutate: func(value *ClaimInput) { value.PreconditionDigest = "other-precondition" }},
+		{name: "policy", mutate: func(value *ClaimInput) { value.PolicyVersion = "other-policy" }},
+		{name: "coordinator", mutate: func(value *ClaimInput) { value.CoordinatorID = "other-coordinator" }},
+		{name: "key id", mutate: func(value *ClaimInput) { value.KeyID = "other-key" }},
+	} {
+		t.Run("tampered "+test.name, func(t *testing.T) {
+			tampered := claim
+			test.mutate(&tampered.Input)
+			if err := VerifyClaim(tampered, key.Public().(ed25519.PublicKey), expected); !errors.Is(err, ErrInvalidSignature) {
+				t.Fatalf("tampered claim error = %v, want %v", err, ErrInvalidSignature)
+			}
+		})
+	}
+}
+
+func TestClaimVerificationAllowsBoundedClockSkewOnly(t *testing.T) {
+	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	key := testSigningKey()
+	snapshot := testSnapshot()
+	input := ClaimInput{
+		ClaimID: "claim-skew", RequestKey: "request-skew", Action: ActionRunStart,
+		Runtime: snapshot.Runtime, Claimant: testClaimant, SnapshotDigest: snapshot.Digest,
+		PreconditionDigest: snapshot.Digest, PolicyVersion: testPolicyVersion,
+		CoordinatorID: testCoordinatorID, KeyID: testKeyID,
+		IssuedAt: now.Add(DefaultMaxClockSkew), StartBy: now.Add(time.Minute), ExpiresAt: now.Add(2 * time.Minute),
+	}
+	claim, err := SignClaim(key, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), testVerification(input, now)); err != nil {
+		t.Fatalf("claim at skew boundary: %v", err)
+	}
+	beyond := testVerification(input, now.Add(-time.Nanosecond))
+	if err := VerifyClaim(claim, key.Public().(ed25519.PublicKey), beyond); !errors.Is(err, ErrClaimFuture) {
+		t.Fatalf("claim beyond skew boundary error = %v, want %v", err, ErrClaimFuture)
 	}
 }
 
@@ -403,6 +513,10 @@ func TestLeaseValidateForBindsClaimAndRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Action = claim.Input.Action
+	request.RequestKey = claim.Input.RequestKey
+	request.PreconditionDigest = claim.Input.PreconditionDigest
+	request.PolicyVersion = claim.Input.PolicyVersion
 	if err := lease.ValidateFor(claim, request); err != nil {
 		t.Fatalf("validate lease: %v", err)
 	}
@@ -464,6 +578,44 @@ func TestInMemoryCoordinatorRejectsStaleClaimAfterLedgerAdvances(t *testing.T) {
 	}
 	if _, err := coordinator.Prepare(ctx, stale, snapshot); !errors.Is(err, ErrLedgerConflict) {
 		t.Fatalf("stale claim error = %v, want %v", err, ErrLedgerConflict)
+	}
+}
+
+func TestInMemoryCoordinatorRejectsRequestKeyReplay(t *testing.T) {
+	now := time.Date(2026, 7, 24, 15, 0, 0, 0, time.UTC)
+	coordinator, err := NewInMemory(InMemoryConfig{
+		PrivateKey: testSigningKey(), Clock: func() time.Time { return now }, NextID: deterministicIDs(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	snapshot := testSnapshot()
+	request := Request{
+		Runtime: snapshot.Runtime, Claimant: testClaimant, Snapshot: snapshot,
+		Action: ActionRunStart, RequestKey: "stable-request-key",
+		PreconditionDigest: snapshot.Digest, PolicyVersion: testPolicyVersion,
+	}
+	first, err := coordinator.Acquire(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := coordinator.Acquire(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := coordinator.Prepare(ctx, first, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Start(ctx, lease, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Complete(ctx, lease, "completed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := coordinator.Prepare(ctx, replay, snapshot); !errors.Is(err, ErrClaimReplay) {
+		t.Fatalf("request-key replay error = %v, want %v", err, ErrClaimReplay)
 	}
 }
 
