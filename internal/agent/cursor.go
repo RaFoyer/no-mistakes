@@ -103,7 +103,7 @@ func (a *cursorAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, error
 	if fix && !opts.isolatedWorktree {
 		return nil, fmt.Errorf("cursor fix phase requires a verified daemon-owned isolated worktree")
 	}
-	cmd := exec.CommandContext(ctx, resolvedBin, a.buildArgs(model, fix)...)
+	cmd := newCursorCommand(ctx, resolvedBin, a.buildArgs(model, fix)...)
 	cmd.Dir = opts.CWD
 	cmd.Stdin = strings.NewReader(stdinPrompt)
 	cmd.Env = cursorProcessEnv(ctx, opts.CWD, a.homeDir, a.configDir)
@@ -163,7 +163,7 @@ func resolveCursorBinary(bin string) (string, error) {
 }
 
 func (a *cursorAgent) checkVersion(ctx context.Context, cwd, bin string) error {
-	cmd := exec.CommandContext(ctx, bin, "--version")
+	cmd := newCursorCommand(ctx, bin, "--version")
 	cmd.Dir = cwd
 	cmd.Env = cursorProcessEnv(ctx, cwd, a.homeDir, a.configDir)
 	out, err := shellenv.CombinedOutputShellCommand(cmd)
@@ -298,7 +298,7 @@ func (a *cursorAgent) checkAuthentication(ctx context.Context, cwd, bin string) 
 	}
 	statusCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(statusCtx, bin, "status", "--format", "json")
+	cmd := newCursorCommand(statusCtx, bin, "status", "--format", "json")
 	cmd.Dir = cwd
 	cmd.Env = cursorProcessEnv(statusCtx, cwd, a.homeDir, a.configDir)
 	shellenv.ConfigureShellCommand(cmd)

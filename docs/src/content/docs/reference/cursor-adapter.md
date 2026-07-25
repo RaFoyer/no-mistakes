@@ -21,15 +21,18 @@ Cursor has no verified project-instruction suppression mechanism in this support
 Create repository-specific `profile` and `home` directories with mode `0700`, then authenticate the supported Cursor binary once under that exact environment. Replace the two example paths with the absolute values configured in `cursor_config_dir` and `cursor_home_dir`:
 
 ```sh
-env -u CURSOR_API_KEY -u CURSOR_ACCESS_TOKEN -u CURSOR_REFRESH_TOKEN \
-  HOME='/Users/you/.config/agent-connectors/owner%2Frepo/cursor/home' \
-  CURSOR_CONFIG_DIR='/Users/you/.config/agent-connectors/owner%2Frepo/cursor/profile' \
-  AGENT_CLI_CREDENTIAL_STORE=file \
-  NO_OPEN_BROWSER=1 \
-  /Users/you/.local/bin/cursor-agent login
+(
+  umask 077
+  env -u CURSOR_API_KEY -u CURSOR_ACCESS_TOKEN -u CURSOR_REFRESH_TOKEN \
+    HOME='/Users/you/.config/agent-connectors/owner%2Frepo/cursor/home' \
+    CURSOR_CONFIG_DIR='/Users/you/.config/agent-connectors/owner%2Frepo/cursor/profile' \
+    AGENT_CLI_CREDENTIAL_STORE=file \
+    NO_OPEN_BROWSER=1 \
+    /Users/you/.local/bin/cursor-agent login
+)
 ```
 
-The login is intentionally operator-run and interactive. Daemon launches never open a browser and never fall back to the operator's ambient home, profile, keychain, API key, or tokens. Keep both roots private: all directories must be `0700`; all files must be regular, single-linked, current-user-owned, and `0600`; symlinks and special files are refused. A missing root or unauthenticated status parks the run as authorization-required rather than starting the model or moving to a fallback provider.
+The private umask ensures state created during login starts with owner-only permissions. The login is intentionally operator-run and interactive. Daemon launches apply the same private umask, never open a browser, and never fall back to the operator's ambient home, profile, keychain, API key, or tokens. Keep both roots private: all directories must be `0700`; all files must be regular, single-linked, current-user-owned, and `0600`; symlinks and special files are refused. A missing root or unauthenticated status parks the run as authorization-required rather than starting the model or moving to a fallback provider. Existing unsafe entries are never automatically repaired; normalize them explicitly before retrying.
 
 ## Model evidence
 

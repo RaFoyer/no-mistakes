@@ -3,10 +3,12 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -112,6 +114,40 @@ sleep 30
 	}
 }
 
+func TestCursorPrivateCommandPreservesLifecyclePID(t *testing.T) {
+	capture := filepath.Join(t.TempDir(), "pid")
+	t.Setenv("CURSOR_PID_CAPTURE", capture)
+	bin := writeCursorFixture(t, `
+printf '%s' "$$" > "$CURSOR_PID_CAPTURE"
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s","model":"Cursor Grok 4.5 Medium"}'
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s","usage":{"inputTokens":1,"outputTokens":1}}'
+`)
+	var events []LifecycleEvent
+	a := &cursorAgent{bin: bin, configDir: privateCursorProfile(t), homeDir: privateCursorHome(t)}
+	_, err := a.runOnce(context.Background(), RunOpts{
+		Prompt: "review", CWD: t.TempDir(), Purpose: "review",
+		Routing:     routing.Decide(routing.Input{Harness: "cursor", Purpose: "review"}),
+		OnLifecycle: func(event LifecycleEvent) { events = append(events, event) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidBytes, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualPID, err := strconv.Atoi(string(pidBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Phase != LifecyclePhaseStart || events[1].Phase != LifecyclePhaseExit {
+		t.Fatalf("lifecycle events = %+v, want start and exit", events)
+	}
+	if events[0].PID != actualPID || events[1].PID != actualPID {
+		t.Fatalf("lifecycle PIDs = %d/%d, executed Cursor PID = %d", events[0].PID, events[1].PID, actualPID)
+	}
+}
+
 func TestCursorRunSurfacesNonzeroExit(t *testing.T) {
 	bin := writeCursorFixture(t, "echo 'provider unavailable' >&2\nexit 7\n")
 	a := &cursorAgent{bin: bin, configDir: privateCursorProfile(t), homeDir: privateCursorHome(t)}
@@ -127,6 +163,11 @@ func TestCursorRunAuthenticationPreflightUsesExactIsolatedEnvironment(t *testing
 	t.Setenv("CURSOR_EXPECT_HOME", home)
 	t.Setenv("CURSOR_EXPECT_PROFILE", profile)
 	bin := writeCursorFixtureRaw(t, `#!/bin/sh
+phase=model
+if [ "$1" = "--version" ]; then phase=version; fi
+if [ "$1" = "status" ]; then phase=status; fi
+mkdir -p "$HOME/phase-$phase"
+printf private > "$CURSOR_CONFIG_DIR/phase-$phase"
 test "$HOME" = "$CURSOR_EXPECT_HOME" || { echo "wrong HOME" >&2; exit 9; }
 test "$CURSOR_CONFIG_DIR" = "$CURSOR_EXPECT_PROFILE" || { echo "wrong CURSOR_CONFIG_DIR" >&2; exit 9; }
 test "$AGENT_CLI_CREDENTIAL_STORE" = "file" || exit 9
@@ -144,6 +185,72 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"o
 	a := &cursorAgent{bin: bin, configDir: profile, homeDir: home}
 	if _, err := a.runOnce(context.Background(), RunOpts{Prompt: "review", CWD: t.TempDir(), Purpose: "review", Routing: routing.Decide(routing.Input{Harness: "cursor", Purpose: "review"})}); err != nil {
 		t.Fatal(err)
+	}
+	for _, phase := range []string{"version", "status", "model"} {
+		fileInfo, err := os.Stat(filepath.Join(profile, "phase-"+phase))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fileInfo.Mode().Perm() != 0o600 {
+			t.Fatalf("%s phase file mode = %04o, want 0600", phase, fileInfo.Mode().Perm())
+		}
+		dirInfo, err := os.Stat(filepath.Join(home, "phase-"+phase))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dirInfo.Mode().Perm() != 0o700 {
+			t.Fatalf("%s phase directory mode = %04o, want 0700", phase, dirInfo.Mode().Perm())
+		}
+	}
+}
+
+func TestCursorPrivateCommandPreservesLiteralArgv(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "fixture with spaces")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(root, "cursor fixture")
+	capture := filepath.Join(root, "captured args")
+	createdDir := filepath.Join(root, "created state")
+	injection := filepath.Join(root, "must-not-exist")
+	script := `#!/bin/sh
+printf '%s\000' "$@" > "$CURSOR_TEST_CAPTURE"
+mkdir "$CURSOR_TEST_CREATED_DIR"
+printf private > "$CURSOR_TEST_CREATED_DIR/token"
+`
+	if err := os.WriteFile(bin, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	literal := []string{"value with spaces", "$(touch " + injection + ")", "semi;colon", "quote'\"value"}
+	cmd := newCursorCommand(context.Background(), bin, literal...)
+	cmd.Env = append(os.Environ(), "CURSOR_TEST_CAPTURE="+capture, "CURSOR_TEST_CREATED_DIR="+createdDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("private command: %v: %s", err, out)
+	}
+	data, err := os.ReadFile(capture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := bytes.Split(bytes.TrimSuffix(data, []byte{0}), []byte{0})
+	if len(parts) != len(literal) {
+		t.Fatalf("literal argv count = %d, want %d (%q)", len(parts), len(literal), data)
+	}
+	for i, want := range literal {
+		if string(parts[i]) != want {
+			t.Fatalf("argv[%d] = %q, want %q", i, parts[i], want)
+		}
+	}
+	if _, err := os.Stat(injection); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("metacharacter argument executed: %v", err)
+	}
+	for path, want := range map[string]os.FileMode{capture: 0o600, createdDir: 0o700, filepath.Join(createdDir, "token"): 0o600} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != want {
+			t.Fatalf("%s mode = %04o, want %04o", path, info.Mode().Perm(), want)
+		}
 	}
 }
 

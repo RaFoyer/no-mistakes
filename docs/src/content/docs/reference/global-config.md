@@ -120,7 +120,7 @@ Absolute path to the repository-scoped home used for every Cursor version probe,
 | Type    | `string`                         |
 | Default | Empty (Cursor launch is refused) |
 
-Before each model invocation, no-mistakes runs a five-second, size-bounded `cursor-agent status --format json` probe under the exact same isolated environment. It proceeds only when the status and access/refresh-token fields all report authenticated.
+Before each model invocation, no-mistakes runs a five-second, size-bounded `cursor-agent status --format json` probe under the exact same isolated environment. Every Unix Cursor subprocess runs with umask `077`, so newly created state starts private; existing unsafe entries still fail closed and are never auto-repaired. The model proceeds only when the status and access/refresh-token fields all report authenticated.
 
 ### acpx_path
 
