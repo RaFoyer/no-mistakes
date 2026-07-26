@@ -135,11 +135,11 @@ message bytes. The coordinator signs one canonical versioned byte encoding; it
 does not sign JSON with unstable whitespace or field order.
 
 1. Create the key ring and asymmetric key only after owner approval.
-2. Use `SOFTWARE` protection. The live Cloud KMS API rejects
-   `EC_SIGN_ED25519` with `HSM` protection, while the coordinator and every
-   fleet verifier use Ed25519. Preserving that fleet-wide algorithm contract
-   takes precedence over the HSM label. Cloud KMS software private-key material
-   remains non-exportable through the service API, IAM-gated, and audit-logged.
+2. Use the owner-approved `SOFTWARE` protection. `EC_SIGN_ED25519` is
+   supported with both `SOFTWARE` and `HSM` protection, and the selected
+   software configuration preserves the fleet-wide Ed25519 contract. Cloud KMS
+   software private-key material remains non-exportable through the service API,
+   IAM-gated, and audit-logged.
    See Google's [key purposes and algorithms](https://cloud.google.com/kms/docs/algorithms)
    and [protection levels](https://cloud.google.com/kms/docs/protection-levels)
    references.
