@@ -3,12 +3,12 @@ title: Coordinator Provisioning
 description: Owner-review manifest for the external shared-runtime admission coordinator on Google Cloud.
 ---
 
-:::caution[Provisioning gate]
-This page is an **inert proposal**, not an installation script or grant of
-authority. None of the resources, identities, APIs, IAM bindings, databases,
-keys, services, or secrets below have been created. A project owner must approve
-the exact project, region, protection level, identities, budget, and manifest
-revision before any provisioning command may run.
+:::note[Provisioning state]
+The owner-approved project resources through workload identity and budget
+alerting are provisioned in `agent-organizer-503615`. The Artifact Registry
+repository does not yet contain an immutable coordinator image, so Cloud Run
+remains undeployed and live admission remains inactive. The command inventory
+below remains review evidence, not permission to repeat provisioning.
 :::
 
 The external coordinator is the authority required by
@@ -23,21 +23,20 @@ never silently redefine that identity.
 | Decision | Proposed value | Owner action |
 | --- | --- | --- |
 | Cloud | Google Cloud only | Confirmed constraint |
-| Project boundary | Dedicated repository-scoped project | Select final project ID and billing account |
-| Primary region | `us-east4` | Approve or select another single region |
-| Service runtime | Private authenticated Cloud Run service, scale-to-zero | Approve |
-| Monotonic ledger | Firestore Native mode, default database, regional location | Approve |
-| Signing | Cloud HSM asymmetric signing key, `EC_SIGN_ED25519` | Approve HSM cost and lifecycle |
-| Workload identity | Attached runtime service account; no downloaded key | Approve |
-| Client identity | Workload Identity Federation or an owner-approved Google identity | Select external identity issuer |
+| Project boundary | Existing project `agent-organizer-503615` | Approved and billing-linked |
+| Primary region | `us-east4` | Approved |
+| Service runtime | Private authenticated Cloud Run service, scale-to-zero | Pending immutable image |
+| Monotonic ledger | Firestore Native mode, `(default)`, `us-east4` | Provisioned |
+| Signing | Cloud KMS software asymmetric signing key, `EC_SIGN_ED25519` | Approved for fleet-wide Ed25519 compatibility |
+| Workload identity | Attached runtime service account; no downloaded key | Provisioned |
+| Client identity | GitHub OIDC restricted to `RaFoyer/no-mistakes` | Provisioned |
 | Secret storage | None in v1 unless a non-Google peer credential is proven necessary | Approve omission |
 | Production anchor | `fleet-coordinator-7bef4abe76e2` | Confirmed |
 
-The required project variable is
-`FLEET_COORDINATOR_PROJECT_ID=<OWNER_SELECTED_REPOSITORY_SCOPED_PROJECT_ID>`.
-It must resolve to a project dedicated to the No-Mistakes coordinator under the
-fleet's repository-scoped GCP hierarchy. Do not infer it from an ambient
-`gcloud` configuration, another repository, or a user-default project.
+The approved project variable is
+`FLEET_COORDINATOR_PROJECT_ID=agent-organizer-503615`. Provisioning uses the
+isolated coordinator gcloud profile and never infers a project from ambient
+configuration.
 
 ## Trust and network boundaries
 
@@ -84,17 +83,17 @@ All names are deterministic and carry the labels:
 
 | Resource | Proposed name | Configuration |
 | --- | --- | --- |
-| GCP project | owner-selected ID | Dedicated repository-scoped project with billing and budget alerts |
+| GCP project | `agent-organizer-503615` | Existing owner-designated project with billing and budget alerts |
 | Cloud Run service | `nm-admission-coordinator-prod` | `us-east4`, request billing, min 0, max 3, concurrency 8, 1 CPU, 512 MiB |
 | Runtime service account | `nm-coordinator-runtime` | Attached only to the Cloud Run service |
-| Client principal | owner-selected WIF principal set | `roles/run.invoker` on the one service |
+| Client principal | `RaFoyer/no-mistakes` GitHub OIDC principal set | `roles/run.invoker` on the one service after deployment |
 | KMS key ring | `nm-admission-prod` | `us-east4` |
-| KMS asymmetric key | `fleet-coordinator-signing` | `ASYMMETRIC_SIGN`, HSM protection required by `EC_SIGN_ED25519` |
+| KMS asymmetric key | `fleet-coordinator-signing` | `ASYMMETRIC_SIGN`, `SOFTWARE` protection, `EC_SIGN_ED25519` |
 | Initial key version | version `1` | `EC_SIGN_ED25519`, enabled after verification |
 | Firestore database | `(default)` | Native mode, regional location matching the approved region |
 | Artifact Registry | `nm-coordinator` | Docker repository in the approved region |
 | Log bucket | `nm-admission-audit` | Regional, 365-day retention; no payload bodies or credentials |
-| Budget | `nm-admission-monthly` | Owner-selected amount; alerts proposed at 50%, 80%, 100% |
+| Budget | `No-Mistakes admission coordinator monthly` | `$8`; alerts at 50%, 80%, 100% |
 
 Required APIs:
 
@@ -134,8 +133,14 @@ message bytes. The coordinator signs one canonical versioned byte encoding; it
 does not sign JSON with unstable whitespace or field order.
 
 1. Create the key ring and asymmetric key only after owner approval.
-2. Use HSM protection. Google Cloud exposes `EC_SIGN_ED25519` only at the HSM
-   protection level; software protection is not a compatible alternative.
+2. Use `SOFTWARE` protection. The live Cloud KMS API rejects
+   `EC_SIGN_ED25519` with `HSM` protection, while the coordinator and every
+   fleet verifier use Ed25519. Preserving that fleet-wide algorithm contract
+   takes precedence over the HSM label. Cloud KMS software private-key material
+   remains non-exportable through the service API, IAM-gated, and audit-logged.
+   See Google's [key purposes and algorithms](https://cloud.google.com/kms/docs/algorithms)
+   and [protection levels](https://cloud.google.com/kms/docs/protection-levels)
+   references.
 3. Retrieve and independently pin the public key, version resource name,
    algorithm, and key ID before enabling admission.
 4. Use manual rotation initially. A new version enters `verify-only`, receives
@@ -210,10 +215,10 @@ than 5 GiB logs, and negligible same-region transfer.
 | --- | ---: |
 | Cloud Run | `$0–$2` |
 | Firestore Standard | `$0–$1` |
-| Cloud KMS HSM Ed25519 key: one active version + 100k signs | about `$4.00` |
+| Cloud KMS software Ed25519 key: one active version + 100k signs | about `$0.36` |
 | Artifact Registry | `$0–$1` |
 | Cloud Logging/Monitoring | `$0` under included ingestion; retention/volume can add cost |
-| **Expected HSM-key total** | **`$3–$8/month`** |
+| **Expected software-key total** | **`$1–$5/month`** |
 
 Add a 100% alert at the owner-approved budget, but do not treat a budget alert
 as a hard spending cap. Recalculate with the
@@ -224,25 +229,20 @@ before approval. Pricing sources:
 [Firestore](https://cloud.google.com/firestore/pricing), and
 [Cloud Logging retention](https://cloud.google.com/logging/quotas#logs_retention_periods).
 
-## Inert provisioning inventory
+## Provisioning command inventory
 
-The following is reviewable command-shaped inventory. It is **NOT EXECUTED**.
-It intentionally lacks a real project ID, billing account, organization/folder,
-client principal, container digest, and budget amount.
+The following records the approved values and command shape. It is not
+permission to repeat completed operations. The immutable container digest is
+the only intentionally unresolved deployment value.
 
 ```sh
-# INERT / NOT EXECUTED — owner must replace and approve every REQUIRED value.
-FLEET_COORDINATOR_PROJECT_ID='<REQUIRED_OWNER_SELECTED_PROJECT_ID>'
+FLEET_COORDINATOR_PROJECT_ID='agent-organizer-503615'
 FLEET_COORDINATOR_REGION='us-east4'
-FLEET_COORDINATOR_BILLING_ACCOUNT='<REQUIRED_OWNER_SELECTED_BILLING_ACCOUNT>'
-FLEET_COORDINATOR_FOLDER='<REQUIRED_REPOSITORY_SCOPED_FOLDER_ID>'
-FLEET_COORDINATOR_CLIENT_MEMBER='<REQUIRED_WIF_PRINCIPAL_SET_OR_GOOGLE_PRINCIPAL>'
+FLEET_COORDINATOR_BILLING_ACCOUNT='01BEFD-7B2FB4-93B084'
+FLEET_COORDINATOR_CLIENT_MEMBER='principalSet://iam.googleapis.com/projects/67974302072/locations/global/workloadIdentityPools/no-mistakes-github/attribute.repository/RaFoyer/no-mistakes'
 FLEET_COORDINATOR_IMAGE='<REQUIRED_IMMUTABLE_ARTIFACT_DIGEST>'
-FLEET_COORDINATOR_BUDGET_USD='<REQUIRED_OWNER_APPROVED_MONTHLY_AMOUNT>'
+FLEET_COORDINATOR_BUDGET_USD='8'
 
-gcloud projects create "${FLEET_COORDINATOR_PROJECT_ID}" \
-  --folder="${FLEET_COORDINATOR_FOLDER}" \
-  --name='No-Mistakes Fleet Admission Coordinator'
 gcloud billing projects link "${FLEET_COORDINATOR_PROJECT_ID}" \
   --billing-account="${FLEET_COORDINATOR_BILLING_ACCOUNT}"
 
@@ -266,7 +266,7 @@ gcloud kms keys create fleet-coordinator-signing \
   --location="${FLEET_COORDINATOR_REGION}" \
   --purpose=asymmetric-signing \
   --default-algorithm=ec-sign-ed25519 \
-  --protection-level=hsm \
+  --protection-level=software \
   --project="${FLEET_COORDINATOR_PROJECT_ID}"
 
 gcloud firestore databases create \
@@ -359,25 +359,20 @@ authorized provisioning transaction run.
 - If coordinator state cannot be proven, fresh starts remain fail-closed while
   existing runs and the daemon remain untouched.
 
-## Owner decisions required
+## Remaining deployment decisions
 
-Provisioning cannot begin until the owner selects or approves:
+Project placement, billing, region, signing protection, WIF repository scope,
+and the `$8` budget are approved and provisioned. Deployment remains blocked
+until the owner reviews:
 
-1. Exact repository-scoped project ID, folder/organization, and billing account.
-2. `us-east4` or another single region compatible with Cloud Run, Firestore,
-   Cloud KMS, and the fleet's residency requirements.
-3. HSM KMS protection and its expected cost; it is required for
-   `EC_SIGN_ED25519`.
-4. Workload Identity Federation issuer, audience, subject mapping, and allowed
-   client principal set.
-5. Firestore default database, PITR/backup policy, and recovery objectives.
-6. 365-day application-audit retention and any export destination.
-7. Monthly budget amount and alert recipients.
-8. Whether staging shares the production project or receives a distinct
+1. Firestore PITR/backup policy and recovery objectives.
+2. 365-day application-audit retention and any export destination.
+3. Whether staging shares the production project or receives a distinct
    repository-scoped project.
-9. Final ingress design after client location is known.
-10. Exact provisioning manifest revision after implementation fixes the API
-    fields, datastore indexes, and immutable container digest.
+4. Final ingress design after client location is known.
+5. The immutable container digest and exact serving revision.
+6. Exact deployment manifest revision after implementation fixes the API
+   fields and datastore indexes.
 
-Until those decisions and a separate provisioning authorization exist, this
-document remains planning evidence only.
+Until those decisions and a separate deployment authorization exist, Cloud Run
+remains absent and live admission stays inactive.
