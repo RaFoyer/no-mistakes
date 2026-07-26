@@ -4,11 +4,12 @@ description: Owner-review manifest for the external shared-runtime admission coo
 ---
 
 :::note[Provisioning state]
-The owner-approved project resources through workload identity and budget
-alerting are provisioned in `agent-organizer-503615`. The Artifact Registry
-repository does not yet contain an immutable coordinator image, so Cloud Run
-remains undeployed and live admission remains inactive. The command inventory
-below remains review evidence, not permission to repeat provisioning.
+The owner-approved project resources through workload identity, audit logging,
+and budget alerting are provisioned in `agent-organizer-503615`. The immutable
+adapter image and serving revision remain unresolved, so Cloud Run remains
+undeployed and live admission remains inactive. Other deployment policy
+decisions remain pending as recorded below. The command inventory remains
+review evidence, not permission to repeat provisioning.
 :::
 
 The external coordinator is the authority required by
@@ -92,7 +93,8 @@ All names are deterministic and carry the labels:
 | Initial key version | version `1` | `EC_SIGN_ED25519`, enabled after verification |
 | Firestore database | `(default)` | Native mode, regional location matching the approved region |
 | Artifact Registry | `nm-coordinator` | Docker repository in the approved region |
-| Log bucket | `nm-admission-audit` | Regional, 365-day retention; no payload bodies or credentials |
+| Log bucket | `projects/agent-organizer-503615/locations/us-east4/buckets/nm-admission-audit` | Regional, 365-day retention; no payload bodies or credentials |
+| Audit sink | `nm-admission-audit` | Routes KMS Data Access logs to the application-audit bucket |
 | Budget | `No-Mistakes admission coordinator monthly` | `$8`; alerts at 50%, 80%, 100% |
 
 Required APIs:
@@ -180,6 +182,16 @@ days. Logs contain resource IDs, bounded hashes, generation, transition,
 latency, result, and caller identity—not claim payloads, repository paths,
 tokens, credentials, prompts, or source content.
 
+The project IAM audit configuration enables `DATA_READ` for
+`cloudkms.googleapis.com`. The provisioned
+`projects/agent-organizer-503615/locations/us-east4/buckets/nm-admission-audit`
+bucket has 365-day retention. Its `nm-admission-audit` sink targets that bucket
+and filters for log names containing
+`cloudaudit.googleapis.com%2Fdata_access` and
+`protoPayload.serviceName=cloudkms.googleapis.com`. Structural validation has
+confirmed the audit policy, bucket, and sink; an end-to-end signing audit-log
+event has not yet been observed.
+
 Alert on:
 
 - rejected signatures, predecessor conflicts, replay, or generation rollback;
@@ -231,9 +243,10 @@ before approval. Pricing sources:
 
 ## Provisioning command inventory
 
-The following records the approved values and command shape. It is not
-permission to repeat completed operations. The immutable container digest is
-the only intentionally unresolved deployment value.
+The following records approved values and command shape. It is not permission
+to repeat completed operations. The immutable adapter image and serving
+revision remain unresolved, and the remaining deployment policy decisions are
+listed below.
 
 ```sh
 FLEET_COORDINATOR_PROJECT_ID='agent-organizer-503615'
@@ -295,11 +308,11 @@ gcloud run services add-iam-policy-binding nm-admission-coordinator-prod \
   --project="${FLEET_COORDINATOR_PROJECT_ID}"
 ```
 
-The final reviewed manifest must also contain exact resource-level IAM commands,
-the Workload Identity Pool/provider mapping, log bucket, metric alerts, budget,
-Firestore indexes/rules, service configuration, and immutable image digest.
-Those depend on owner selections and implemented API fields and must not be
-guessed here.
+The final reviewed deployment manifest must add exact resource-level IAM
+commands, the Workload Identity Pool/provider mapping, metric alerts, Firestore
+indexes/rules, service configuration, the immutable adapter image digest, and
+the serving revision. These remaining values depend on owner selections and
+implemented API fields and must not be guessed here.
 
 ## Installation, validation, and rollback
 
